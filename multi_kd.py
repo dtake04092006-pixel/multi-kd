@@ -6,8 +6,8 @@ import threading
 import json
 import logging
 from flask import Flask, render_template, request, jsonify, redirect, url_for
-from keep_alive import keep_alive
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 # Cấu hình logging để tiết kiệm RAM
 logging.basicConfig(level=logging.WARNING)
@@ -18,10 +18,11 @@ FIXED_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "1️⃣", "2️⃣", "3️⃣"
 GRAB_TIMES = [1.3, 2.3, 3.2, 1.3, 2.3, 3.2]
 
 # Lưu trữ cấu hình panels và bots
-panels_config = {}
+guilds_config = {}
 bot_instances = {}
 current_account_index = 0
 drop_running = False
+loop = None
 
 # Flask app
 app = Flask(__name__)
@@ -56,11 +57,13 @@ AVAILABLE_ACCOUNTS = get_available_accounts()
 
 class OptimizedBot:
     """Bot class tối ưu hóa để tiết kiệm RAM"""
-    def __init__(self, token, panels):
+    def __init__(self, token, guild_name, account_index):
         self.token = token
-        self.panels = panels  # Dictionary {panel_name: channel_id}
+        self.guild_name = guild_name
+        self.account_index = account_index
         self.client = None
         self.is_ready = False
+        self.channel_id = None
         
     async def start(self):
         """Khởi động bot với cấu hình tối ưu"""
@@ -79,143 +82,106 @@ class OptimizedBot:
         @self.client.event
         async def on_ready():
             self.is_ready = True
-            print(f"Bot sẵn sàng: {self.client.user}")
+            if self.guild_name in guilds_config:
+                self.channel_id = guilds_config[self.guild_name]['channel_id']
+            print(f"✅ Bot {self.account_index+1} sẵn sàng cho Guild: {self.guild_name}")
             
         @self.client.event
         async def on_message(message):
-            if message.author.id == KARUTA_ID and "is dropping 3 cards!" in message.content:
-                # Tìm panel tương ứng với channel này
-                panel_name = None
-                for pname, channel_id in self.panels.items():
-                    if str(message.channel.id) == str(channel_id):
-                        panel_name = pname
-                        break
+            if (message.author.id == KARUTA_ID and 
+                "is dropping 3 cards!" in message.content and 
+                str(message.channel.id) == str(self.channel_id)):
                 
-                if panel_name and panel_name in panels_config:
-                    # Tìm account index trong panel
-                    panel = panels_config[panel_name]
-                    for i, acc in enumerate(panel['accounts']):
-                        if acc['token'] == self.token:
-                            emoji = FIXED_EMOJIS[i % len(FIXED_EMOJIS)]
-                            grab_time = GRAB_TIMES[i % len(GRAB_TIMES)]
-                            asyncio.create_task(self.react_to_drop(message, emoji, grab_time))
-                            break
+                emoji = FIXED_EMOJIS[self.account_index % len(FIXED_EMOJIS)]
+                grab_time = GRAB_TIMES[self.account_index % len(GRAB_TIMES)]
+                asyncio.create_task(self.react_to_drop(message, emoji, grab_time))
         
         try:
             await self.client.start(self.token)
         except Exception as e:
-            print(f"Lỗi khởi động bot: {e}")
+            print(f"❌ Lỗi khởi động bot {self.account_index+1}: {e}")
     
     async def react_to_drop(self, message, emoji, delay):
         """React vào drop"""
         await asyncio.sleep(delay)
         try:
             await message.add_reaction(emoji)
-            print(f"Đã react {emoji}")
+            print(f"🎯 Bot {self.account_index+1} đã react {emoji} tại Guild {self.guild_name}")
         except Exception as e:
-            print(f"Lỗi react: {e}")
+            print(f"❌ Lỗi react Bot {self.account_index+1}: {e}")
     
-    async def send_kd(self, channel_id):
+    async def send_kd(self):
         """Gửi lệnh kd"""
-        if not self.is_ready or not self.client:
+        if not self.is_ready or not self.client or not self.channel_id:
             return False
             
         try:
-            channel = self.client.get_channel(int(channel_id))
+            channel = self.client.get_channel(int(self.channel_id))
             if channel:
                 await channel.send("kd")
-                print(f"Đã gửi kd tại {channel_id}")
+                print(f"📤 Bot {self.account_index+1} đã gửi kd tại Guild {self.guild_name}")
                 return True
         except Exception as e:
-            print(f"Lỗi gửi kd: {e}")
+            print(f"❌ Lỗi gửi kd Bot {self.account_index+1}: {e}")
         return False
 
 # Web Routes
 @app.route('/')
 def index():
     return render_template('index.html', 
-                         panels=panels_config, 
+                         guilds=guilds_config, 
                          available_accounts=AVAILABLE_ACCOUNTS,
-                         drop_status="Đang chạy" if drop_running else "Dừng")
+                         drop_status="🟢 Đang chạy" if drop_running else "🔴 Dừng")
 
-@app.route('/create_panel', methods=['POST'])
-def create_panel():
-    panel_name = request.form['panel_name']
-    if panel_name in panels_config:
-        return jsonify({'error': 'Panel đã tồn tại'}), 400
+@app.route('/create_guild', methods=['POST'])
+def create_guild():
+    guild_name = request.form['guild_name'].strip()
+    channel_id = request.form['channel_id'].strip()
+    selected_accounts = request.form.getlist('accounts')
     
-    panels_config[panel_name] = {
-        'accounts': [],
-        'channels': {}
-    }
-    return redirect(url_for('index'))
-
-@app.route('/delete_panel/<panel_name>')
-def delete_panel(panel_name):
-    if panel_name in panels_config:
-        del panels_config[panel_name]
-        # Dọn dẹp bots
-        asyncio.create_task(cleanup_panel_bots(panel_name))
-    return redirect(url_for('index'))
-
-@app.route('/add_account', methods=['POST'])
-def add_account():
-    panel_name = request.form['panel_name']
-    account_id = request.form['account_id']
-    channel_id = request.form['channel_id']
+    if not guild_name or not channel_id:
+        return jsonify({'error': 'Vui lòng nhập đầy đủ thông tin'}), 400
     
-    if panel_name not in panels_config:
-        return jsonify({'error': 'Panel không tồn tại'}), 400
-    
-    panel = panels_config[panel_name]
-    
-    # Tìm account info
-    account_info = None
-    for acc in AVAILABLE_ACCOUNTS:
-        if acc['id'] == account_id:
-            account_info = acc
-            break
-    
-    if not account_info:
-        return jsonify({'error': 'Account không hợp lệ'}), 400
-    
-    if len(panel['accounts']) >= 6:
-        return jsonify({'error': 'Panel đã đủ 6 accounts'}), 400
-    
-    # Thêm account vào panel
-    panel['accounts'].append({
-        'name': account_info['name'],
-        'token': account_info['token'],
-        'id': account_info['id']
-    })
-    panel['channels'][account_info['id']] = channel_id
-    
-    # Khởi động bot cho account này
-    asyncio.create_task(start_account_bot(account_info['token'], panel_name, channel_id))
-    
-    return redirect(url_for('index'))
-
-@app.route('/remove_account/<panel_name>/<account_id>')
-def remove_account(panel_name, account_id):
-    if panel_name in panels_config:
-        panel = panels_config[panel_name]
-        panel['accounts'] = [acc for acc in panel['accounts'] if acc['id'] != account_id]
-        if account_id in panel['channels']:
-            del panel['channels'][account_id]
+    if guild_name in guilds_config:
+        return jsonify({'error': 'Guild đã tồn tại'}), 400
         
-        # Dọn dẹp bot
-        bot_key = f"{panel_name}_{account_id}"
-        if bot_key in bot_instances:
-            asyncio.create_task(cleanup_bot(bot_key))
+    if len(selected_accounts) != 6:
+        return jsonify({'error': 'Phải chọn đúng 6 accounts'}), 400
     
+    # Tạo guild config
+    guild_accounts = []
+    for acc_id in selected_accounts:
+        for acc in AVAILABLE_ACCOUNTS:
+            if acc['id'] == acc_id:
+                guild_accounts.append(acc)
+                break
+    
+    guilds_config[guild_name] = {
+        'channel_id': channel_id,
+        'accounts': guild_accounts
+    }
+    
+    # Khởi động bots cho guild này
+    if loop:
+        asyncio.run_coroutine_threadsafe(start_guild_bots(guild_name), loop)
+    
+    return redirect(url_for('index'))
+
+@app.route('/delete_guild/<guild_name>')
+def delete_guild(guild_name):
+    if guild_name in guilds_config:
+        # Dọn dẹp bots
+        if loop:
+            asyncio.run_coroutine_threadsafe(cleanup_guild_bots(guild_name), loop)
+        del guilds_config[guild_name]
     return redirect(url_for('index'))
 
 @app.route('/start_drop')
 def start_drop():
     global drop_running
-    if not drop_running:
+    if not drop_running and loop:
         drop_running = True
-        asyncio.create_task(drop_loop())
+        asyncio.run_coroutine_threadsafe(drop_loop(), loop)
     return redirect(url_for('index'))
 
 @app.route('/stop_drop')
@@ -224,30 +190,39 @@ def stop_drop():
     drop_running = False
     return redirect(url_for('index'))
 
+@app.route('/status')
+def status():
+    return jsonify({
+        'guilds': len(guilds_config),
+        'bots': len(bot_instances),
+        'drop_running': drop_running,
+        'accounts_available': len(AVAILABLE_ACCOUNTS)
+    })
+
 # Bot Management Functions
-async def start_account_bot(token, panel_name, channel_id):
-    """Khởi động bot cho một account"""
-    bot_key = f"{panel_name}_{token[:10]}"
-    
-    if bot_key in bot_instances:
+async def start_guild_bots(guild_name):
+    """Khởi động tất cả bots cho một guild"""
+    if guild_name not in guilds_config:
         return
     
-    panels_for_bot = {panel_name: channel_id}
-    bot = OptimizedBot(token, panels_for_bot)
-    bot_instances[bot_key] = bot
+    guild = guilds_config[guild_name]
+    tasks = []
     
-    try:
-        await bot.start()
-    except Exception as e:
-        print(f"Lỗi khởi động bot {bot_key}: {e}")
-        if bot_key in bot_instances:
-            del bot_instances[bot_key]
+    for i, account in enumerate(guild['accounts']):
+        bot_key = f"{guild_name}_bot{i+1}"
+        if bot_key not in bot_instances:
+            bot = OptimizedBot(account['token'], guild_name, i)
+            bot_instances[bot_key] = bot
+            tasks.append(bot.start())
+    
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-async def cleanup_panel_bots(panel_name):
-    """Dọn dẹp tất cả bots của một panel"""
+async def cleanup_guild_bots(guild_name):
+    """Dọn dẹp tất cả bots của một guild"""
     keys_to_remove = []
     for key, bot in bot_instances.items():
-        if key.startswith(f"{panel_name}_"):
+        if key.startswith(f"{guild_name}_"):
             keys_to_remove.append(key)
             if bot.client:
                 await bot.client.close()
@@ -255,20 +230,14 @@ async def cleanup_panel_bots(panel_name):
     for key in keys_to_remove:
         del bot_instances[key]
 
-async def cleanup_bot(bot_key):
-    """Dọn dẹp một bot cụ thể"""
-    if bot_key in bot_instances:
-        bot = bot_instances[bot_key]
-        if bot.client:
-            await bot.client.close()
-        del bot_instances[bot_key]
-
 async def drop_loop():
     """Vòng lặp drop tối ưu"""
     global current_account_index, drop_running
     
+    print("🚀 Bắt đầu Drop Loop!")
+    
     while drop_running:
-        if not panels_config:
+        if not guilds_config:
             await asyncio.sleep(10)
             continue
             
@@ -277,33 +246,28 @@ async def drop_loop():
         
         tasks = []
         
-        # Gửi kd cho tất cả panels với account index tương ứng
-        for panel_name, panel in panels_config.items():
-            if len(panel['accounts']) > account_idx:
-                account = panel['accounts'][account_idx]
-                channel_id = panel['channels'].get(account['id'])
-                
-                if channel_id:
-                    # Tìm bot tương ứng
-                    bot_key = f"{panel_name}_{account['token'][:10]}"
-                    if bot_key in bot_instances:
-                        tasks.append(bot_instances[bot_key].send_kd(channel_id))
+        # Gửi kd cho tất cả guilds với account index tương ứng
+        for guild_name in guilds_config:
+            bot_key = f"{guild_name}_bot{account_idx+1}"
+            if bot_key in bot_instances:
+                tasks.append(bot_instances[bot_key].send_kd())
         
         # Thực hiện tất cả lệnh kd đồng thời
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             success_count = sum(1 for r in results if r is True)
-            print(f"Đã gửi kd cho account {account_idx + 1}: {success_count}/{len(tasks)} thành công")
+            print(f"📊 Account {account_idx + 1}: {success_count}/{len(tasks)} guilds thành công")
         
         # Chuyển sang account tiếp theo
         current_account_index += 1
         
         # Đợi 305 giây
+        print(f"⏳ Đợi 305 giây để chuyển sang Account {(current_account_index % 6) + 1}...")
         await asyncio.sleep(305)
 
-# HTML Template
+# HTML Template với giao diện đẹp
 def create_templates():
-    """Tạo template HTML"""
+    """Tạo template HTML với giao diện hiện đại"""
     os.makedirs('templates', exist_ok=True)
     
     html_content = '''<!DOCTYPE html>
@@ -311,119 +275,447 @@ def create_templates():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Karuta Multi-Server Manager</title>
+    <title>🎴 Karuta Multi-Guild Manager</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
-        .header { text-align: center; color: #333; margin-bottom: 30px; }
-        .status { padding: 10px; margin: 10px 0; border-radius: 5px; text-align: center; font-weight: bold; }
-        .status.running { background: #d4edda; color: #155724; }
-        .status.stopped { background: #f8d7da; color: #721c24; }
-        .controls { margin: 20px 0; text-align: center; }
-        .btn { padding: 10px 20px; margin: 5px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
-        .btn-primary { background: #007bff; color: white; }
-        .btn-success { background: #28a745; color: white; }
-        .btn-danger { background: #dc3545; color: white; }
-        .btn-warning { background: #ffc107; color: #212529; }
-        .panel { border: 1px solid #ddd; margin: 20px 0; padding: 15px; border-radius: 5px; background: #f9f9f9; }
-        .panel-header { font-size: 18px; font-weight: bold; margin-bottom: 10px; color: #333; }
-        .form-group { margin: 10px 0; }
-        .form-group label { display: inline-block; width: 120px; font-weight: bold; }
-        .form-group input, .form-group select { padding: 5px; width: 200px; }
-        .account-list { margin: 10px 0; }
-        .account-item { padding: 8px; margin: 5px 0; background: #e9ecef; border-radius: 3px; display: flex; justify-content: space-between; align-items: center; }
-        .create-panel { background: #fff; padding: 20px; margin: 20px 0; border-radius: 5px; border: 2px dashed #007bff; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+        
+        .container { 
+            max-width: 1400px; 
+            margin: 0 auto; 
+            padding: 20px;
+        }
+        
+        .header { 
+            text-align: center; 
+            color: white; 
+            margin-bottom: 40px;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .header h1 { 
+            font-size: 2.5rem; 
+            margin-bottom: 10px;
+            font-weight: 300;
+        }
+        
+        .status-bar { 
+            display: flex; 
+            justify-content: center; 
+            gap: 20px; 
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        
+        .status-item { 
+            background: rgba(255,255,255,0.15); 
+            backdrop-filter: blur(10px);
+            padding: 15px 25px; 
+            border-radius: 15px; 
+            color: white; 
+            font-weight: 500;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .status-item.running { background: rgba(40, 167, 69, 0.8); }
+        .status-item.stopped { background: rgba(220, 53, 69, 0.8); }
+        
+        .controls { 
+            text-align: center; 
+            margin: 30px 0;
+        }
+        
+        .btn { 
+            padding: 12px 25px; 
+            margin: 8px; 
+            border: none; 
+            border-radius: 25px; 
+            cursor: pointer; 
+            text-decoration: none; 
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
+        
+        .btn-primary { background: linear-gradient(45deg, #007bff, #0056b3); color: white; }
+        .btn-success { background: linear-gradient(45deg, #28a745, #1e7e34); color: white; }
+        .btn-danger { background: linear-gradient(45deg, #dc3545, #c82333); color: white; }
+        .btn-warning { background: linear-gradient(45deg, #ffc107, #e0a800); color: #212529; }
+        .btn-info { background: linear-gradient(45deg, #17a2b8, #138496); color: white; }
+        
+        .card { 
+            background: rgba(255,255,255,0.95); 
+            backdrop-filter: blur(15px);
+            margin: 20px 0; 
+            padding: 25px; 
+            border-radius: 20px; 
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .card-header { 
+            font-size: 1.3rem; 
+            font-weight: 600; 
+            margin-bottom: 20px; 
+            color: #495057;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .form-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); 
+            gap: 20px;
+            margin: 20px 0;
+        }
+        
+        .form-group { 
+            margin: 15px 0; 
+        }
+        
+        .form-group label { 
+            display: block; 
+            margin-bottom: 8px; 
+            font-weight: 600; 
+            color: #495057;
+        }
+        
+        .form-group input, .form-group select { 
+            width: 100%; 
+            padding: 12px 15px; 
+            border: 2px solid #e9ecef; 
+            border-radius: 10px;
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+        
+        .form-group input:focus, .form-group select:focus { 
+            border-color: #007bff; 
+            outline: none; 
+            box-shadow: 0 0 0 3px rgba(0,123,255,0.1);
+        }
+        
+        .accounts-selector { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+            gap: 10px;
+            margin: 15px 0;
+        }
+        
+        .account-checkbox { 
+            display: flex; 
+            align-items: center; 
+            padding: 10px; 
+            background: #f8f9fa; 
+            border-radius: 8px;
+            transition: all 0.2s ease;
+        }
+        
+        .account-checkbox:hover { background: #e9ecef; }
+        
+        .account-checkbox input { 
+            margin-right: 10px; 
+            width: auto;
+        }
+        
+        .guild-item { 
+            background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+            padding: 20px; 
+            margin: 15px 0; 
+            border-radius: 15px;
+            border-left: 5px solid #007bff;
+        }
+        
+        .guild-header { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            margin-bottom: 15px;
+        }
+        
+        .guild-title { 
+            font-size: 1.2rem; 
+            font-weight: 600; 
+            color: #495057;
+        }
+        
+        .accounts-list { 
+            display: flex; 
+            flex-wrap: wrap; 
+            gap: 10px;
+        }
+        
+        .account-tag { 
+            background: linear-gradient(45deg, #6c757d, #495057);
+            color: white; 
+            padding: 5px 12px; 
+            border-radius: 15px; 
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+        
+        .empty-state { 
+            text-align: center; 
+            color: white; 
+            margin: 50px 0;
+            opacity: 0.8;
+        }
+        
+        .empty-state i { 
+            font-size: 3rem; 
+            margin-bottom: 20px; 
+            opacity: 0.5;
+        }
+        
+        @media (max-width: 768px) {
+            .container { padding: 10px; }
+            .header h1 { font-size: 2rem; }
+            .form-grid { grid-template-columns: 1fr; }
+            .accounts-selector { grid-template-columns: 1fr; }
+            .btn { padding: 10px 20px; margin: 5px; }
+        }
+        
+        .loading { 
+            display: inline-block; 
+            width: 20px; 
+            height: 20px; 
+            border: 3px solid rgba(255,255,255,.3); 
+            border-radius: 50%; 
+            border-top-color: #fff; 
+            animation: spin 1s ease-in-out infinite;
+        }
+        
+        @keyframes spin { to { transform: rotate(360deg); } }
+        
+        .alert { 
+            padding: 15px; 
+            margin: 20px 0; 
+            border-radius: 10px; 
+            border-left: 4px solid;
+        }
+        
+        .alert-info { 
+            background: rgba(23, 162, 184, 0.1); 
+            border-color: #17a2b8; 
+            color: #0c5460;
+        }
+        
+        .stats-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); 
+            gap: 15px; 
+            margin: 20px 0;
+        }
+        
+        .stat-item { 
+            text-align: center; 
+            background: rgba(255,255,255,0.1); 
+            padding: 15px; 
+            border-radius: 15px; 
+            color: white;
+        }
+        
+        .stat-number { 
+            font-size: 2rem; 
+            font-weight: bold; 
+            display: block;
+        }
+        
+        .stat-label { 
+            font-size: 0.9rem; 
+            opacity: 0.8;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎴 Karuta Multi-Server Manager</h1>
-            <div class="status {{ 'running' if drop_status == 'Đang chạy' else 'stopped' }}">
-                Trạng thái Drop: {{ drop_status }}
+            <h1><i class="fas fa-cards-blank"></i> Karuta Multi-Guild Manager</h1>
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <span class="stat-number">{{ guilds|length }}</span>
+                    <span class="stat-label">Guilds</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-number">{{ available_accounts|length }}</span>
+                    <span class="stat-label">Accounts</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-number">{{ guilds|length * 6 }}</span>
+                    <span class="stat-label">Total Bots</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="status-bar">
+            <div class="status-item {{ 'running' if 'Đang chạy' in drop_status else 'stopped' }}">
+                <i class="fas {{ 'fa-play' if 'Đang chạy' in drop_status else 'fa-stop' }}"></i>
+                Drop Status: {{ drop_status }}
             </div>
         </div>
 
         <div class="controls">
-            <a href="/start_drop" class="btn btn-success">▶️ Bắt đầu Drop</a>
-            <a href="/stop_drop" class="btn btn-danger">⏹️ Dừng Drop</a>
+            <a href="/start_drop" class="btn btn-success">
+                <i class="fas fa-play"></i> Bắt đầu Drop
+            </a>
+            <a href="/stop_drop" class="btn btn-danger">
+                <i class="fas fa-stop"></i> Dừng Drop
+            </a>
+            <a href="/status" class="btn btn-info">
+                <i class="fas fa-chart-line"></i> Trạng thái
+            </a>
         </div>
 
-        <div class="create-panel">
-            <h3>➕ Tạo Panel Mới</h3>
-            <form method="POST" action="/create_panel">
-                <div class="form-group">
-                    <label>Tên Panel:</label>
-                    <input type="text" name="panel_name" required placeholder="VD: Server1, Guild2...">
-                    <button type="submit" class="btn btn-primary">Tạo Panel</button>
-                </div>
-            </form>
-        </div>
-
-        {% for panel_name, panel in panels.items() %}
-        <div class="panel">
-            <div class="panel-header">
-                📋 Panel: {{ panel_name }} ({{ panel.accounts|length }}/6 accounts)
-                <a href="/delete_panel/{{ panel_name }}" class="btn btn-danger" 
-                   onclick="return confirm('Xóa panel này?')" style="float: right;">❌ Xóa</a>
+        <div class="card">
+            <div class="card-header">
+                <span><i class="fas fa-plus"></i> Tạo Guild Mới</span>
             </div>
-
-            <div class="account-list">
-                {% for account in panel.accounts %}
-                <div class="account-item">
-                    <span>👤 {{ account.name }} → 📍 Channel: {{ panel.channels[account.id] }}</span>
-                    <a href="/remove_account/{{ panel_name }}/{{ account.id }}" 
-                       class="btn btn-warning" onclick="return confirm('Xóa account này?')">🗑️</a>
-                </div>
-                {% endfor %}
+            
+            {% if available_accounts|length < 6 %}
+            <div class="alert alert-info">
+                <i class="fas fa-info-circle"></i>
+                <strong>Cảnh báo:</strong> Bạn chỉ có {{ available_accounts|length }} accounts. 
+                Cần ít nhất 6 accounts để tạo guild. Vui lòng thêm tokens vào biến môi trường TOKENS.
             </div>
+            {% else %}
+            <form method="POST" action="/create_guild">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label><i class="fas fa-server"></i> Tên Guild</label>
+                        <input type="text" name="guild_name" required placeholder="VD: Server1, MainGuild, TestServer...">
+                    </div>
+                    <div class="form-group">
+                        <label><i class="fas fa-hashtag"></i> Channel ID</label>
+                        <input type="text" name="channel_id" required placeholder="123456789012345678">
+                    </div>
+                </div>
 
-            {% if panel.accounts|length < 6 %}
-            <form method="POST" action="/add_account">
-                <input type="hidden" name="panel_name" value="{{ panel_name }}">
                 <div class="form-group">
-                    <label>Account:</label>
-                    <select name="account_id" required>
-                        <option value="">Chọn account...</option>
-                        {% for acc in available_accounts %}
-                        <option value="{{ acc.id }}">{{ acc.name }}</option>
+                    <label><i class="fas fa-users"></i> Chọn 6 Accounts ({{ available_accounts|length }} available)</label>
+                    <div class="accounts-selector">
+                        {% for account in available_accounts %}
+                        <div class="account-checkbox">
+                            <input type="checkbox" name="accounts" value="{{ account.id }}" id="acc_{{ account.id }}">
+                            <label for="acc_{{ account.id }}">{{ account.name }}</label>
+                        </div>
                         {% endfor %}
-                    </select>
+                    </div>
                 </div>
-                <div class="form-group">
-                    <label>Channel ID:</label>
-                    <input type="text" name="channel_id" required placeholder="123456789012345678">
-                    <button type="submit" class="btn btn-success">➕ Thêm</button>
-                </div>
+
+                <button type="submit" class="btn btn-primary">
+                    <i class="fas fa-rocket"></i> Tạo Guild
+                </button>
             </form>
             {% endif %}
         </div>
+
+        {% for guild_name, guild in guilds.items() %}
+        <div class="guild-item">
+            <div class="guild-header">
+                <div class="guild-title">
+                    <i class="fas fa-shield-alt"></i> {{ guild_name }}
+                    <small style="opacity: 0.7;">• Channel: {{ guild.channel_id }}</small>
+                </div>
+                <a href="/delete_guild/{{ guild_name }}" class="btn btn-danger" 
+                   onclick="return confirm('⚠️ Xóa guild {{ guild_name }}?\\n\\nSẽ dừng tất cả bots của guild này!')">
+                    <i class="fas fa-trash"></i> Xóa
+                </a>
+            </div>
+
+            <div class="accounts-list">
+                {% for account in guild.accounts %}
+                <span class="account-tag">
+                    <i class="fas fa-robot"></i> {{ account.name }}
+                </span>
+                {% endfor %}
+            </div>
+        </div>
         {% endfor %}
 
-        {% if not panels %}
-        <div style="text-align: center; color: #666; margin: 50px 0;">
-            <p>🎯 Chưa có panel nào. Tạo panel đầu tiên để bắt đầu!</p>
+        {% if not guilds %}
+        <div class="empty-state">
+            <i class="fas fa-plus-circle"></i>
+            <h3>Chưa có Guild nào</h3>
+            <p>Tạo Guild đầu tiên để bắt đầu farming!</p>
         </div>
         {% endif %}
     </div>
+
+    <script>
+        // Validation cho form
+        document.querySelector('form')?.addEventListener('submit', function(e) {
+            const checkboxes = document.querySelectorAll('input[name="accounts"]:checked');
+            if (checkboxes.length !== 6) {
+                e.preventDefault();
+                alert('⚠️ Bạn phải chọn đúng 6 accounts!\\n\\nHiện tại: ' + checkboxes.length + '/6');
+                return false;
+            }
+        });
+
+        // Auto refresh status mỗi 30s
+        setInterval(() => {
+            fetch('/status')
+                .then(r => r.json())
+                .then(data => {
+                    console.log('Status:', data);
+                })
+                .catch(e => console.log('Status check failed:', e));
+        }, 30000);
+
+        // Checkbox limit
+        document.addEventListener('change', function(e) {
+            if (e.target.name === 'accounts') {
+                const checked = document.querySelectorAll('input[name="accounts"]:checked');
+                const all = document.querySelectorAll('input[name="accounts"]');
+                
+                if (checked.length >= 6) {
+                    all.forEach(cb => {
+                        if (!cb.checked) cb.disabled = true;
+                    });
+                } else {
+                    all.forEach(cb => cb.disabled = false);
+                }
+            }
+        });
+    </script>
 </body>
 </html>'''
     
     with open('templates/index.html', 'w', encoding='utf-8') as f:
         f.write(html_content)
 
+def run_flask():
+    """Chạy Flask trong thread riêng"""
+    app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
+
 async def main():
     """Hàm main tối ưu"""
+    global loop
+    loop = asyncio.get_event_loop()
+    
     # Tạo templates
     create_templates()
     
-    # Khởi động keep_alive trong thread riêng
-    keep_alive_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080, debug=False))
-    keep_alive_thread.daemon = True
-    keep_alive_thread.start()
+    # Khởi động Flask trong thread riêng
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     
-    print("🚀 Karuta Multi-Server Manager đã khởi động!")
+    print("🚀 Karuta Multi-Guild Manager đã khởi động!")
     print(f"📊 Tìm thấy {len(AVAILABLE_ACCOUNTS)} accounts")
+    print(f"🌐 Web Interface: http://localhost:8080")
     
     # Giữ chương trình chạy
     while True:
@@ -436,4 +728,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Đang dừng chương trình...")
+        print("🛑 Đang dừng chương trình...")
