@@ -422,7 +422,7 @@ HTML_TEMPLATE = """
 @app.route('/')
 def index():
     tokens = load_tokens()
-    return render_template_string(HTML_TEMPLATE, panels=panels, tokens=tokens)
+    return render_template_string(HTML_TEMPLATE, panels=panels, tokens=tokens, enumerate=enumerate, range=range)
 
 @app.route('/create', methods=['POST'])
 def create_panel():
