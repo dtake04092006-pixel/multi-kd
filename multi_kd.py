@@ -201,8 +201,6 @@ async def run_listener_bot():
     # Sử dụng token của tài khoản đầu tiên để lắng nghe
     listener_token = GLOBAL_ACCOUNTS[0]["token"]
     
-    intents = discord.Intents.default()
-    intents.message_content = True
     listener_bot = commands.Bot(command_prefix="!слушать", self_bot=True, intents=intents)
 
     @listener_bot.event
