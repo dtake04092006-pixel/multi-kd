@@ -314,6 +314,7 @@ HTML_TEMPLATE = """
 document.addEventListener('DOMContentLoaded', function () {
     const API_ENDPOINT = '/api/panels';
 
+    // Hàm gọi API chung, không thay đổi
     async function apiCall(method, data = null) {
         try {
             const options = {
@@ -331,6 +332,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
     
+    // Hàm vẽ các panel, không thay đổi
     function renderPanels(panels) {
         const grid = document.getElementById('farm-grid');
         grid.innerHTML = '';
@@ -380,9 +382,9 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
     
-    // --- PHẦN SỬA LỖI NẰM Ở ĐÂY ---
+    // --- LOGIC ĐÃ SỬA LỖI ---
 
-    // Hàm này chỉ cập nhật các text trạng thái, không vẽ lại panel
+    // 1. Hàm này CHỈ cập nhật các dòng text ở thanh trạng thái
     async function updateStatus() {
         const response = await fetch('/status');
         const data = await response.json();
@@ -393,7 +395,7 @@ document.addEventListener('DOMContentLoaded', function () {
         document.getElementById('countdown').textContent = new Date(data.countdown * 1000).toISOString().substr(14, 5);
 
         const toggleBtn = document.getElementById('toggle-kd-btn');
-        if (toggleBtn) { // Kiểm tra nếu nút tồn tại
+        if (toggleBtn) {
             if (data.is_kd_loop_enabled) {
                 toggleBtn.textContent = 'TẮT VÒNG LẶP KD';
                 toggleBtn.classList.remove('btn-danger');
@@ -406,18 +408,19 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
-    // Hàm này fetch và vẽ lại toàn bộ panel
+    // 2. Hàm này CHỈ dùng để fetch và vẽ lại các panel khi cần
     async function fetchAndRenderPanels() {
         const response = await fetch('/status');
         const data = await response.json();
         renderPanels(data.panels);
     }
     
+    // 3. Các sự kiện thêm/xóa sẽ gọi hàm vẽ lại panel
     document.getElementById('add-panel-btn').addEventListener('click', async () => {
         const name = prompt('Nhập tên cho panel mới:', 'Farm Server Mới');
         if (name) {
             await apiCall('POST', { name });
-            fetchAndRenderPanels(); // Chỉ vẽ lại panel khi thêm
+            fetchAndRenderPanels(); // Vẽ lại panel sau khi thêm
         }
     });
 
@@ -427,14 +430,12 @@ document.addEventListener('DOMContentLoaded', function () {
             const panelId = panelEl.dataset.id;
             if (confirm(`Bạn có chắc muốn xóa panel "${panelEl.querySelector('.panel-name').textContent}"?`)) {
                 await apiCall('DELETE', { id: panelId });
-                fetchAndRenderPanels(); // Chỉ vẽ lại panel khi xóa
+                fetchAndRenderPanels(); // Vẽ lại panel sau khi xóa
             }
         }
     });
     
-    // --- HẾT PHẦN SỬA LỖI ---
-
-
+    // Các sự kiện thay đổi dữ liệu (chọn acc, đổi tên...) chỉ gửi API, không vẽ lại giao diện
     document.getElementById('farm-grid').addEventListener('change', async (e) => {
         const panelEl = e.target.closest('.panel');
         if (!panelEl) return;
@@ -451,7 +452,6 @@ document.addEventListener('DOMContentLoaded', function () {
         } else {
             return;
         }
-
         await apiCall('PUT', payload);
     });
     
@@ -468,12 +468,15 @@ document.addEventListener('DOMContentLoaded', function () {
     if (toggleBtn) {
         toggleBtn.addEventListener('click', async () => {
             await fetch('/api/toggle_kd', { method: 'POST' });
-            updateStatus();
+            updateStatus(); // Chỉ cập nhật text nút bấm, không vẽ lại panel
         });
     }
 
-    setInterval(updateStatus, 2000); // Bây giờ chỉ cập nhật status, không vẽ lại panel
-    fetchAndRenderPanels(); // Vẽ các panel lần đầu khi tải trang
+    // 4. Vòng lặp tự động CHỈ gọi hàm cập nhật status, KHÔNG vẽ lại panel
+    setInterval(updateStatus, 2000); 
+    
+    // 5. Vẽ toàn bộ panel lần đầu tiên khi tải trang
+    fetchAndRenderPanels(); 
 });
 </script>
 </body>
