@@ -1,790 +1,550 @@
+# TÊN FILE: main.py
+# PHIÊN BẢN: Multi-Farm Deep Control v2.0
 import discord
 from discord.ext import commands
 import asyncio
 import os
-import json
 import threading
-from flask import Flask, render_template, request, jsonify, redirect, url_for
-from werkzeug.serving import make_server
-import logging
+import time
+import requests
+import json
+import random
+from flask import Flask, request, render_template_string, jsonify
+from dotenv import load_dotenv
 
-# Tắt logging của discord.py để tiết kiệm RAM
-logging.getLogger('discord').setLevel(logging.CRITICAL)
+load_dotenv()
 
-# --- Cấu hình ---
+# --- CẤU HÌNH & BIẾN TOÀN CỤC ---
 KARUTA_ID = 646937666251915264
-FIXED_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "1️⃣", "2️⃣", "3️⃣"]
-GRAB_TIMES = [1.3, 2.3, 3.2, 1.3, 2.3, 3.2]
 
-# Lưu trữ global state
-bot_instances = {}  # {token: bot_instance}
-panels = {}  # {panel_id: panel_config}
-current_drop_index = 0
-is_running = False
+# Tải danh sách tài khoản từ biến môi trường
+TOKENS_STR = os.getenv("TOKENS", "")
+ACC_NAMES_STR = os.getenv("ACC_NAMES", "")
 
-# Flask app
-app = Flask(__name__)
+# Xử lý danh sách tài khoản
+GLOBAL_ACCOUNTS = []
+tokens_list = [token.strip() for token in TOKENS_STR.split(',') if token.strip()]
+acc_names_list = [name.strip() for name in ACC_NAMES_STR.split(',') if name.strip()]
 
-# --- Utility Functions ---
-def load_tokens_from_env():
-    """Load tokens từ environment variable"""
-    tokens_str = os.getenv('TOKENS', '')
-    if tokens_str:
-        return [token.strip() for token in tokens_str.split(',') if token.strip()]
-    return []
+for i, token in enumerate(tokens_list):
+    name = acc_names_list[i] if i < len(acc_names_list) else f"Account {i + 1}"
+    GLOBAL_ACCOUNTS.append({"id": f"acc_{i}", "name": name, "token": token})
 
-def save_panels():
-    """Lưu panels vào file để persistence"""
+# Biến trạng thái, sẽ được load từ JSONBin
+panels = []
+current_drop_slot = 0 # Slot đang trong lượt drop (0-5)
+bot_ready = False
+listener_bot = None
+
+# --- CÁC HÀM TIỆN ÍCH & API DISCORD ---
+
+def send_message_http(token, channel_id, content):
+    """Gửi tin nhắn đến một kênh bằng requests, không cần bot instance."""
+    if not token or not channel_id: return
+    headers = {"Authorization": token}
+    payload = {"content": content}
+    url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
     try:
-        with open('panels.json', 'w') as f:
-            json.dump(panels, f)
-    except:
-        pass
+        res = requests.post(url, headers=headers, json=payload, timeout=10)
+        if res.status_code == 200:
+            print(f"[HTTP SEND] Gửi '{content}' tới kênh {channel_id} thành công.")
+        else:
+            print(f"[HTTP SEND ERROR] Lỗi khi gửi tin nhắn tới kênh {channel_id}: {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"[HTTP SEND EXCEPTION] Lỗi ngoại lệ khi gửi tin nhắn: {e}")
+
+def add_reaction_http(token, channel_id, message_id, emoji):
+    """Thả reaction vào tin nhắn bằng requests."""
+    if not token or not channel_id: return
+    headers = {"Authorization": token}
+    # Emoji cần được URL-encoded (ví dụ: 1️⃣ -> %31%EF%B8%8F%E2%83%A3)
+    encoded_emoji = requests.utils.quote(emoji)
+    url = f"https://discord.com/api/v9/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me"
+    try:
+        res = requests.put(url, headers=headers, timeout=10)
+        if res.status_code != 204: # 204 No Content là thành công
+             print(f"[HTTP REACT ERROR] Lỗi khi thả reaction {emoji} tới kênh {channel_id}: {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"[HTTP REACT EXCEPTION] Lỗi ngoại lệ khi thả reaction: {e}")
+
+# --- LƯU & TẢI CẤU HÌNH PANEL ---
+def save_panels():
+    """Lưu cấu hình các panel lên JSONBin.io"""
+    api_key = os.getenv("JSONBIN_API_KEY")
+    bin_id = os.getenv("JSONBIN_BIN_ID")
+    if not api_key or not bin_id:
+        print("[Settings] Thiếu API Key hoặc Bin ID của JSONBin. Bỏ qua việc lưu.")
+        return
+
+    headers = {'Content-Type': 'application/json', 'X-Master-Key': api_key}
+    url = f"https://api.jsonbin.io/v3/b/{bin_id}"
+    try:
+        # Chạy trong luồng riêng để không block
+        def do_save():
+            req = requests.put(url, json=panels, headers=headers, timeout=15)
+            if req.status_code == 200:
+                print("[Settings] Đã lưu cấu hình panels lên JSONBin.io thành công.")
+            else:
+                print(f"[Settings] Lỗi khi lưu cài đặt: {req.status_code} - {req.text}")
+        threading.Thread(target=do_save, daemon=True).start()
+    except Exception as e:
+        print(f"[Settings] Exception khi lưu cài đặt: {e}")
 
 def load_panels():
-    """Load panels từ file"""
+    """Tải cấu hình các panel từ JSONBin.io"""
     global panels
+    api_key = os.getenv("JSONBIN_API_KEY")
+    bin_id = os.getenv("JSONBIN_BIN_ID")
+    if not api_key or not bin_id:
+        print("[Settings] Thiếu API Key hoặc Bin ID của JSONBin. Bắt đầu với cấu hình rỗng.")
+        return
+
+    headers = {'X-Master-Key': api_key, 'X-Bin-Meta': 'false'}
+    url = f"https://api.jsonbin.io/v3/b/{bin_id}/latest"
     try:
-        with open('panels.json', 'r') as f:
-            panels = json.load(f)
-    except:
-        panels = {}
-
-# --- Bot Management ---
-class OptimizedBot(commands.Bot):
-    """Bot tối ưu hóa để tiết kiệm RAM"""
-    def __init__(self, token):
-        # Tối ưu hóa intents để giảm RAM
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.guilds = False
-        intents.members = False
-        intents.presences = False
-        
-        super().__init__(
-            command_prefix="!",
-            self_bot=True,
-            intents=intents,
-            chunk_guilds_at_startup=False,
-            member_cache_flags=discord.MemberCacheFlags.none()
-        )
-        self.token_value = token
-        self.is_ready_flag = False
-
-    async def setup_hook(self):
-        """Setup bot sau khi ready"""
-        self.is_ready_flag = True
-
-async def create_bot_instance(token):
-    """Tạo một bot instance"""
-    if token in bot_instances:
-        return bot_instances[token]
-    
-    bot = OptimizedBot(token)
-    
-    @bot.event
-    async def on_ready():
-        print(f"Bot ready: {bot.user} (ID: {bot.user.id})")
-        bot.is_ready_flag = True
-
-    @bot.event
-    async def on_message(message):
-        if message.author.id != KARUTA_ID:
-            return
-        
-        if "is dropping 3 cards!" not in message.content:
-            return
-        
-        # Tìm panel có channel này
-        for panel_id, panel in panels.items():
-            if str(message.channel.id) in panel['channels']:
-                channel_config = panel['channels'][str(message.channel.id)]
-                account_tokens = channel_config['accounts']
-                
-                if token in account_tokens:
-                    account_index = account_tokens.index(token)
-                    emoji = FIXED_EMOJIS[account_index]
-                    grab_time = GRAB_TIMES[account_index]
-                    
-                    asyncio.create_task(react_to_drop(message, emoji, grab_time))
-                break
-
-    # Không start bot ngay, chỉ tạo instance
-    bot_instances[token] = bot
-    return bot
-
-async def react_to_drop(message, emoji, delay):
-    """React vào drop message"""
-    await asyncio.sleep(delay)
-    try:
-        await message.add_reaction(emoji)
+        req = requests.get(url, headers=headers, timeout=15)
+        if req.status_code == 200:
+            data = req.json()
+            if isinstance(data, list):
+                panels = data
+                print(f"[Settings] Đã tải {len(panels)} panel từ JSONBin.io.")
+            else: # Nếu bin rỗng hoặc sai định dạng
+                save_panels() # Lưu cấu trúc rỗng lên
+        else:
+            print(f"[Settings] Lỗi khi tải cài đặt: {req.status_code} - {req.text}")
     except Exception as e:
-        print(f"Error reacting: {e}")
+        print(f"[Settings] Exception khi tải cài đặt: {e}")
 
-async def drop_loop():
-    """Vòng lặp drop chính"""
-    global current_drop_index, is_running
-    
-    while is_running:
+
+# --- LOGIC BOT CHÍNH ---
+
+async def drop_sender_loop():
+    """Vòng lặp gửi 'kd', luân phiên giữa các slot tài khoản."""
+    global current_drop_slot
+    print("Vòng lặp gửi 'kd' đang chờ bot sẵn sàng...")
+    while not bot_ready:
+        await asyncio.sleep(1)
+    print("Bot đã sẵn sàng. Bắt đầu vòng lặp gửi 'kd'.")
+
+    while True:
         try:
-            # Đợi tất cả bot ready
-            ready_bots = [bot for bot in bot_instances.values() if bot.is_ready_flag]
-            if len(ready_bots) == 0:
-                await asyncio.sleep(5)
-                continue
-            
-            # Lấy tất cả channels từ tất cả panels
-            all_tasks = []
-            
-            for panel_id, panel in panels.items():
-                for channel_id, channel_config in panel['channels'].items():
-                    if len(channel_config['accounts']) > current_drop_index:
-                        token = channel_config['accounts'][current_drop_index]
-                        if token in bot_instances:
-                            bot = bot_instances[token]
-                            if bot.is_ready_flag:
-                                task = send_drop_command(bot, int(channel_id))
-                                all_tasks.append(task)
-            
-            # Gửi tất cả lệnh drop cùng lúc
-            if all_tasks:
-                await asyncio.gather(*all_tasks, return_exceptions=True)
-                print(f"Sent drop commands for account index {current_drop_index + 1}")
-            
-            # Chuyển sang account tiếp theo
-            current_drop_index = (current_drop_index + 1) % 6
-            
-            # Đợi 305 giây
+            slot_key = f"slot_{current_drop_slot + 1}"
+            print(f"\n--- Đang trong lượt của Slot {current_drop_slot + 1} ---")
+
+            tasks = []
+            active_sends = 0
+            # Duyệt qua tất cả các panel đã cấu hình
+            for panel in panels:
+                channel_id = panel.get("channel_id")
+                # Lấy ra token được gán cho slot hiện tại trong panel này
+                token_to_use = panel.get("accounts", {}).get(slot_key)
+
+                if token_to_use and channel_id:
+                    # Tạo task gửi tin nhắn bằng HTTP request
+                    # Dùng lambda để bắt giá trị của token và channel_id tại thời điểm lặp
+                    task = asyncio.to_thread(send_message_http, token_to_use, channel_id, "kd")
+                    tasks.append(task)
+                    active_sends +=1
+                
+            if tasks:
+                print(f"Gửi đồng thời {active_sends} lệnh 'kd' cho các tài khoản ở {slot_key}...")
+                await asyncio.gather(*tasks)
+            else:
+                print(f"Không có tài khoản nào được cấu hình cho {slot_key} trong bất kỳ panel nào.")
+
+            # Chuyển sang slot tiếp theo, quay vòng từ 0 đến 5
+            current_drop_slot = (current_drop_slot + 1) % 6
+
+            print(f"Đã xong lượt. Chờ 305 giây cho lượt kế tiếp (Slot {current_drop_slot + 1})...")
             await asyncio.sleep(305)
-            
+
         except Exception as e:
-            print(f"Error in drop loop: {e}")
-            await asyncio.sleep(10)
+            print(f"[DROP SENDER ERROR] Lỗi nghiêm trọng trong vòng lặp gửi 'kd': {e}")
+            await asyncio.sleep(60) # Chờ 1 phút nếu có lỗi rồi thử lại
 
-async def send_drop_command(bot, channel_id):
-    """Gửi lệnh kd"""
-    try:
-        channel = bot.get_channel(channel_id)
-        if channel:
-            await channel.send("kd")
-            print(f"Sent 'kd' to channel {channel_id} from {bot.user}")
-    except Exception as e:
-        print(f"Error sending drop command: {e}")
+async def handle_reactions(panel, message):
+    """Xử lý việc thả reaction cho 6 tài khoản trong một panel."""
+    accounts_in_panel = panel.get("accounts", {})
+    if not accounts_in_panel: return
 
-# --- Flask Routes ---
-@app.route('/')
-def index():
-    tokens = load_tokens_from_env()
-    return render_template('index.html', panels=panels, tokens=tokens)
-
-@app.route('/create_panel', methods=['POST'])
-def create_panel():
-    panel_name = request.form.get('panel_name')
-    if not panel_name:
-        return jsonify({'error': 'Panel name required'}), 400
+    emojis = ["1️⃣", "2️⃣", "3️⃣", "1️⃣", "2️⃣", "3️⃣"]
+    grab_times = [1.3, 2.3, 3.2, 1.3, 2.3, 3.2]
     
-    panel_id = f"panel_{len(panels) + 1}"
-    panels[panel_id] = {
-        'name': panel_name,
-        'channels': {}
-    }
-    
-    save_panels()
-    return redirect(url_for('index'))
+    tasks = []
+    for i in range(6):
+        slot_key = f"slot_{i + 1}"
+        token = accounts_in_panel.get(slot_key)
+        if token:
+            delay = grab_times[i]
+            emoji = emojis[i]
+            # Tạo coroutine để sleep và sau đó gọi hàm http sync
+            async def react_task(t, ch_id, msg_id, em, d):
+                await asyncio.sleep(d)
+                # Chạy hàm blocking (requests) trong một luồng riêng
+                await asyncio.to_thread(add_reaction_http, t, ch_id, msg_id, em)
+            
+            tasks.append(react_task(token, message.channel.id, message.id, emoji, delay))
 
-@app.route('/delete_panel/<panel_id>')
-def delete_panel(panel_id):
-    if panel_id in panels:
-        del panels[panel_id]
-        save_panels()
-    return redirect(url_for('index'))
+    if tasks:
+        await asyncio.gather(*tasks)
+        print(f"Đã hoàn thành các tác vụ reaction cho drop trong kênh {message.channel.id}")
 
-@app.route('/add_channel', methods=['POST'])
-def add_channel():
-    panel_id = request.form.get('panel_id')
-    channel_id = request.form.get('channel_id')
-    selected_accounts = request.form.getlist('accounts')
-    
-    if not all([panel_id, channel_id]) or len(selected_accounts) != 6:
-        return jsonify({'error': 'Invalid data. Need exactly 6 accounts.'}), 400
-    
-    if panel_id not in panels:
-        return jsonify({'error': 'Panel not found'}), 404
-    
-    panels[panel_id]['channels'][channel_id] = {
-        'accounts': selected_accounts
-    }
-    
-    save_panels()
-    return redirect(url_for('index'))
 
-@app.route('/delete_channel/<panel_id>/<channel_id>')
-def delete_channel(panel_id, channel_id):
-    if panel_id in panels and channel_id in panels[panel_id]['channels']:
-        del panels[panel_id]['channels'][channel_id]
-        save_panels()
-    return redirect(url_for('index'))
-
-@app.route('/start_system', methods=['POST'])
-def start_system():
-    global is_running
-    if not is_running:
-        is_running = True
-        threading.Thread(target=start_bot_system, daemon=True).start()
-        return jsonify({'status': 'started'})
-    return jsonify({'status': 'already running'})
-
-@app.route('/stop_system', methods=['POST'])
-def stop_system():
-    global is_running
-    is_running = False
-    return jsonify({'status': 'stopped'})
-
-@app.route('/status')
-def get_status():
-    return jsonify({
-        'is_running': is_running,
-        'bot_count': len(bot_instances),
-        'ready_bots': len([b for b in bot_instances.values() if b.is_ready_flag]),
-        'panels': len(panels),
-        'current_drop_index': current_drop_index + 1
-    })
-
-def start_bot_system():
-    """Start bot system trong thread riêng"""
-    asyncio.run(bot_manager())
-
-async def bot_manager():
-    """Quản lý tất cả bots"""
-    global is_running
-    
-    # Load tokens
-    tokens = load_tokens_from_env()
-    if not tokens:
-        print("No tokens found in environment!")
+async def run_listener_bot():
+    """Chạy một bot duy nhất để lắng nghe sự kiện drop."""
+    global bot_ready, listener_bot
+    if not GLOBAL_ACCOUNTS:
+        print("Không có token nào trong biến môi trường. Bot không thể khởi động.")
+        bot_ready = True # Đánh dấu để các vòng lặp khác không bị kẹt
         return
     
-    # Tạo tất cả bot instances
-    tasks = []
-    for token in tokens:
-        bot = await create_bot_instance(token)
-        tasks.append(bot.start(token))
+    # Sử dụng token của tài khoản đầu tiên để lắng nghe
+    listener_token = GLOBAL_ACCOUNTS[0]["token"]
     
-    # Start drop loop
-    tasks.append(drop_loop())
-    
-    try:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    except Exception as e:
-        print(f"Error in bot manager: {e}")
+    intents = discord.Intents.default()
+    intents.message_content = True
+    listener_bot = commands.Bot(command_prefix="!слушать", self_bot=True, intents=intents)
 
-# HTML Template
-HTML_TEMPLATE = '''
+    @listener_bot.event
+    async def on_ready():
+        global bot_ready
+        print("-" * 30)
+        print(f"BOT LẮNG NGHE ĐÃ SẴN SÀNG!")
+        print(f"Đăng nhập với tài khoản: {listener_bot.user} (ID: {listener_bot.user.id})")
+        print("Bot này chỉ dùng để nhận diện drop, các hành động khác sẽ được thực hiện qua HTTP.")
+        print("-" * 30)
+        bot_ready = True
+
+    @listener_bot.event
+    async def on_message(message):
+        # Lọc tin nhắn: chỉ từ Karuta và có nội dung drop
+        if message.author.id != KARUTA_ID or "is dropping 3 cards!" not in message.content:
+            return
+
+        # Tìm xem tin nhắn này thuộc panel nào
+        found_panel = None
+        for p in panels:
+            if p.get("channel_id") == str(message.channel.id):
+                found_panel = p
+                break
+        
+        # Nếu tìm thấy panel tương ứng, xử lý thả reaction
+        if found_panel:
+            print(f"Phát hiện drop trong kênh {message.channel.id} (Panel: '{found_panel.get('name')}')")
+            # Tạo task mới để không block on_message
+            asyncio.create_task(handle_reactions(found_panel, message))
+
+    try:
+        await listener_bot.start(listener_token)
+    except discord.errors.LoginFailure:
+        print(f"LỖI ĐĂNG NHẬP NGHIÊM TRỌNG với token của bot lắng nghe. Vui lòng kiểm tra TOKEN đầu tiên trong file .env.")
+        bot_ready = True # Thoát khỏi vòng lặp chờ
+    except Exception as e:
+        print(f"Lỗi không xác định với bot lắng nghe: {e}")
+        bot_ready = True
+
+
+# --- GIAO DIỆN WEB & API FLASK ---
+app = Flask(__name__)
+
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Karuta Multi-Server Manager</title>
+    <title>Multi-Farm Deep Control</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            color: #333;
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        
-        .header {
-            text-align: center;
-            color: white;
-            margin-bottom: 30px;
-        }
-        
-        .header h1 {
-            font-size: 2.5rem;
-            margin-bottom: 10px;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-        }
-        
-        .status-card {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 15px;
-            padding: 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-            backdrop-filter: blur(10px);
-        }
-        
-        .controls {
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-            margin-bottom: 20px;
-        }
-        
-        .btn {
-            background: linear-gradient(45deg, #4facfe, #00f2fe);
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 25px;
-            cursor: pointer;
-            font-weight: bold;
-            transition: all 0.3s;
-            font-size: 14px;
-        }
-        
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
-        }
-        
-        .btn-danger {
-            background: linear-gradient(45deg, #ff6b6b, #ee5a52);
-        }
-        
-        .btn-success {
-            background: linear-gradient(45deg, #51cf66, #40c057);
-        }
-        
-        .card {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 15px;
-            padding: 25px;
-            margin-bottom: 20px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-            backdrop-filter: blur(10px);
-        }
-        
-        .form-group {
-            margin-bottom: 20px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: bold;
-            color: #555;
-        }
-        
-        .form-control {
-            width: 100%;
-            padding: 12px;
-            border: 2px solid #e9ecef;
-            border-radius: 10px;
-            font-size: 16px;
-            transition: all 0.3s;
-        }
-        
-        .form-control:focus {
-            border-color: #4facfe;
-            outline: none;
-            box-shadow: 0 0 0 3px rgba(79, 172, 254, 0.1);
-        }
-        
-        .account-selector {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-top: 10px;
-        }
-        
-        .account-item {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 10px;
-            border: 2px solid transparent;
-            transition: all 0.3s;
-            cursor: pointer;
-        }
-        
-        .account-item:hover {
-            border-color: #4facfe;
-            background: #e3f2fd;
-        }
-        
-        .account-item.selected {
-            background: linear-gradient(45deg, #4facfe, #00f2fe);
-            color: white;
-            border-color: #0066cc;
-        }
-        
-        .panel {
-            border-left: 5px solid #4facfe;
-            margin-bottom: 25px;
-        }
-        
-        .panel-header {
-            background: linear-gradient(45deg, #4facfe, #00f2fe);
-            color: white;
-            padding: 15px 20px;
-            border-radius: 10px 10px 0 0;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .panel-body {
-            background: white;
-            padding: 20px;
-            border-radius: 0 0 10px 10px;
-        }
-        
-        .channel-item {
-            background: #f8f9fa;
-            padding: 15px;
-            margin: 10px 0;
-            border-radius: 10px;
-            border-left: 4px solid #28a745;
-        }
-        
-        .channel-accounts {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            margin-top: 10px;
-        }
-        
-        .account-badge {
-            background: linear-gradient(45deg, #51cf66, #40c057);
-            color: white;
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: bold;
-        }
-        
-        .status-info {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 20px;
-            text-align: center;
-        }
-        
-        .status-item {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 10px;
-            border-top: 4px solid #4facfe;
-        }
-        
-        .status-value {
-            font-size: 2rem;
-            font-weight: bold;
-            color: #4facfe;
-            margin-bottom: 5px;
-        }
-        
-        .status-label {
-            color: #666;
-            font-size: 14px;
-        }
-        
-        .modal {
-            display: none;
-            position: fixed;
-            z-index: 1000;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            backdrop-filter: blur(5px);
-        }
-        
-        .modal-content {
-            background: white;
-            margin: 5% auto;
-            padding: 30px;
-            border-radius: 15px;
-            max-width: 600px;
-            max-height: 80vh;
-            overflow-y: auto;
-            animation: slideIn 0.3s ease;
-        }
-        
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateY(-50px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        
-        .close {
-            color: #aaa;
-            float: right;
-            font-size: 28px;
-            font-weight: bold;
-            cursor: pointer;
-            line-height: 1;
-        }
-        
-        .close:hover { color: #333; }
-        
-        .running { color: #28a745; }
-        .stopped { color: #dc3545; }
-        
-        @media (max-width: 768px) {
-            .container { padding: 10px; }
-            .header h1 { font-size: 2rem; }
-            .controls { flex-direction: column; align-items: center; }
-            .status-info { grid-template-columns: 1fr 1fr; }
-        }
+        :root { --primary-bg: #111; --secondary-bg: #1d1d1d; --panel-bg: #2a2a2a; --border-color: #444; --text-primary: #f0f0f0; --text-secondary: #aaa; --accent-color: #00aaff; --danger-color: #ff4444; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: var(--primary-bg); color: var(--text-primary); margin: 0; padding: 20px; }
+        .container { max-width: 1800px; margin: 0 auto; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .header h1 { color: var(--accent-color); font-weight: 600; }
+        .status-bar { display: flex; justify-content: space-around; background-color: var(--secondary-bg); padding: 15px; border-radius: 8px; margin-bottom: 20px; flex-wrap: wrap; gap: 15px; }
+        .status-item { text-align: center; }
+        .status-item span { display: block; font-size: 0.9em; color: var(--text-secondary); }
+        .status-item strong { font-size: 1.2em; color: var(--accent-color); }
+        .controls { display: flex; justify-content: center; margin-bottom: 30px; }
+        .btn { background-color: var(--accent-color); color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 1em; transition: background-color 0.3s; }
+        .btn:hover { background-color: #0088cc; }
+        .btn-danger { background-color: var(--danger-color); }
+        .btn-danger:hover { background-color: #cc3333; }
+        .farm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 20px; }
+        .panel { background-color: var(--secondary-bg); border: 1px solid var(--border-color); border-radius: 8px; padding: 20px; position: relative; }
+        .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px; }
+        .panel-header h3 { margin: 0; font-size: 1.2em; }
+        .input-group { margin-bottom: 15px; }
+        .input-group label { display: block; color: var(--text-secondary); margin-bottom: 5px; font-size: 0.9em; }
+        .input-group input, .input-group select { width: 100%; background-color: var(--primary-bg); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 5px; box-sizing: border-box; }
+        .account-slots { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎴 Karuta Multi-Server Manager</h1>
-            <p>Quản lý nhiều server và tài khoản một cách dễ dàng</p>
+            <h1>Multi-Farm Deep Control</h1>
+            <p>Quản lý các server farm một cách tập trung và tiết kiệm tài nguyên.</p>
         </div>
-        
-        <!-- Status Card -->
-        <div class="status-card">
-            <h3 style="text-align: center; margin-bottom: 20px;">📊 Trạng thái hệ thống</h3>
-            <div class="status-info">
-                <div class="status-item">
-                    <div class="status-value" id="status">○</div>
-                    <div class="status-label">Trạng thái</div>
-                </div>
-                <div class="status-item">
-                    <div class="status-value" id="bot-count">0</div>
-                    <div class="status-label">Tổng Bot</div>
-                </div>
-                <div class="status-item">
-                    <div class="status-value" id="ready-bots">0</div>
-                    <div class="status-label">Bot sẵn sàng</div>
-                </div>
-                <div class="status-item">
-                    <div class="status-value" id="current-account">1</div>
-                    <div class="status-label">Account hiện tại</div>
-                </div>
+
+        <div class="status-bar">
+            <div class="status-item"><span>Trạng thái Bot</span><strong id="bot-status">Đang khởi động...</strong></div>
+            <div class="status-item"><span>Tổng số Panel</span><strong id="total-panels">0</strong></div>
+            <div class="status-item"><span>Lượt Drop Kế Tiếp</span><strong id="next-slot">Slot 1</strong></div>
+            <div class="status-item"><span>Thời gian chờ</span><strong id="countdown">--:--</strong></div>
+        </div>
+
+        <div class="controls">
+            <button id="add-panel-btn" class="btn"><i class="fas fa-plus"></i> Thêm Panel Mới</button>
+        </div>
+
+        <div id="farm-grid" class="farm-grid">
             </div>
-            
-            <div class="controls">
-                <button class="btn btn-success" onclick="startSystem()">🚀 Khởi động</button>
-                <button class="btn btn-danger" onclick="stopSystem()">⏹ Dừng lại</button>
-                <button class="btn" onclick="refreshStatus()">🔄 Làm mới</button>
-            </div>
-        </div>
-        
-        <!-- Create Panel -->
-        <div class="card">
-            <h3>➕ Tạo Panel mới</h3>
-            <form method="post" action="/create_panel">
-                <div class="form-group">
-                    <label>Tên Panel</label>
-                    <input type="text" name="panel_name" class="form-control" placeholder="Ví dụ: Server Game 1" required>
-                </div>
-                <button type="submit" class="btn">🎨 Tạo Panel</button>
-            </form>
-        </div>
-        
-        <!-- Panels List -->
-        {% for panel_id, panel in panels.items() %}
-        <div class="card panel">
-            <div class="panel-header">
-                <h3>🎯 {{ panel.name }}</h3>
-                <div>
-                    <button class="btn" onclick="openAddChannelModal('{{ panel_id }}', '{{ panel.name }}')">➕ Thêm kênh</button>
-                    <a href="/delete_panel/{{ panel_id }}" class="btn btn-danger" onclick="return confirm('Xác nhận xóa panel này?')">🗑 Xóa</a>
-                </div>
-            </div>
-            <div class="panel-body">
-                {% if panel.channels %}
-                    {% for channel_id, channel_config in panel.channels.items() %}
-                    <div class="channel-item">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>
-                                <strong>📺 Channel ID:</strong> {{ channel_id }}
-                                <div class="channel-accounts">
-                                    {% for account in channel_config.accounts %}
-                                    <span class="account-badge">Account {{ loop.index }}</span>
-                                    {% endfor %}
-                                </div>
-                            </div>
-                            <a href="/delete_channel/{{ panel_id }}/{{ channel_id }}" class="btn btn-danger" onclick="return confirm('Xác nhận xóa kênh này?')">🗑</a>
-                        </div>
-                    </div>
-                    {% endfor %}
-                {% else %}
-                    <p style="text-align: center; color: #666; padding: 20px;">
-                        📭 Chưa có kênh nào. Hãy thêm kênh đầu tiên!
-                    </p>
-                {% endif %}
-            </div>
-        </div>
-        {% endfor %}
-        
-        {% if panels|length == 0 %}
-        <div class="card" style="text-align: center; color: #666;">
-            <h3>📋 Chưa có Panel nào</h3>
-            <p>Tạo panel đầu tiên để bắt đầu quản lý các server của bạn!</p>
-        </div>
-        {% endif %}
     </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    const API_ENDPOINT = '/api/panels';
+
+    async function apiCall(method, data = null) {
+        try {
+            const options = {
+                method: method,
+                headers: { 'Content-Type': 'application/json' },
+            };
+            if (data) options.body = JSON.stringify(data);
+            const response = await fetch(API_ENDPOINT, options);
+            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+            return await response.json();
+        } catch (error) {
+            console.error('API call failed:', error);
+            alert('Thao tác thất bại. Vui lòng kiểm tra console log.');
+            return null;
+        }
+    }
     
-    <!-- Add Channel Modal -->
-    <div id="addChannelModal" class="modal">
-        <div class="modal-content">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                <h3>🔗 Thêm kênh mới</h3>
-                <span class="close" onclick="closeModal()">&times;</span>
-            </div>
-            
-            <form method="post" action="/add_channel">
-                <input type="hidden" name="panel_id" id="modal-panel-id">
-                
-                <div class="form-group">
-                    <label>ID Kênh Discord</label>
-                    <input type="text" name="channel_id" class="form-control" placeholder="123456789012345678" required>
-                </div>
-                
-                <div class="form-group">
-                    <label>Chọn 6 tài khoản (theo thứ tự)</label>
-                    <div class="account-selector" id="account-selector">
-                        {% for token in tokens %}
-                        <div class="account-item" data-token="{{ token }}" onclick="toggleAccount(this)">
-                            <strong>Account {{ loop.index }}</strong>
-                            <div style="font-size: 12px; color: #666; margin-top: 5px;">
-                                Token: {{ token[:10] }}...
-                            </div>
-                        </div>
-                        {% endfor %}
-                    </div>
-                    <div style="margin-top: 10px; font-size: 14px; color: #666;">
-                        <span id="selected-count">0</span>/6 tài khoản đã chọn
-                    </div>
-                </div>
-                
-                <div style="text-align: center;">
-                    <button type="submit" class="btn btn-success">💾 Lưu kênh</button>
-                    <button type="button" class="btn" onclick="closeModal()">❌ Hủy</button>
-                </div>
-            </form>
-        </div>
-    </div>
-    
-    <script>
-        let selectedAccounts = [];
-        
-        // Auto refresh status
-        setInterval(refreshStatus, 5000);
-        refreshStatus();
-        
-        function refreshStatus() {
-            fetch('/status')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('status').textContent = data.is_running ? '🟢 Đang chạy' : '🔴 Dừng';
-                    document.getElementById('status').className = data.is_running ? 'running' : 'stopped';
-                    document.getElementById('bot-count').textContent = data.bot_count;
-                    document.getElementById('ready-bots').textContent = data.ready_bots;
-                    document.getElementById('current-account').textContent = data.current_drop_index;
-                })
-                .catch(console.error);
-        }
-        
-        function startSystem() {
-            fetch('/start_system', {method: 'POST'})
-                .then(response => response.json())
-                .then(data => {
-                    alert(data.status === 'started' ? '🚀 Hệ thống đã khởi động!' : '⚠️ Hệ thống đã đang chạy!');
-                    refreshStatus();
-                })
-                .catch(console.error);
-        }
-        
-        function stopSystem() {
-            if (confirm('Bạn có chắc muốn dừng hệ thống?')) {
-                fetch('/stop_system', {method: 'POST'})
-                    .then(response => response.json())
-                    .then(data => {
-                        alert('⏹ Hệ thống đã dừng!');
-                        refreshStatus();
-                    })
-                    .catch(console.error);
-            }
-        }
-        
-        function openAddChannelModal(panelId, panelName) {
-            document.getElementById('modal-panel-id').value = panelId;
-            document.getElementById('addChannelModal').style.display = 'block';
-            selectedAccounts = [];
-            updateAccountSelection();
-        }
-        
-        function closeModal() {
-            document.getElementById('addChannelModal').style.display = 'none';
-        }
-        
-        function toggleAccount(element) {
-            const token = element.dataset.token;
-            const index = selectedAccounts.indexOf(token);
-            
-            if (index > -1) {
-                selectedAccounts.splice(index, 1);
-                element.classList.remove('selected');
-            } else {
-                if (selectedAccounts.length < 6) {
-                    selectedAccounts.push(token);
-                    element.classList.add('selected');
-                } else {
-                    alert('⚠️ Chỉ có thể chọn tối đa 6 tài khoản!');
-                }
-            }
-            
-            updateAccountSelection();
-        }
-        
-        function updateAccountSelection() {
-            document.getElementById('selected-count').textContent = selectedAccounts.length;
-            
-            // Update hidden inputs
-            const form = document.querySelector('#addChannelModal form');
-            const existingInputs = form.querySelectorAll('input[name="accounts"]');
-            existingInputs.forEach(input => input.remove());
-            
-            selectedAccounts.forEach(token => {
-                const input = document.createElement('input');
-                input.type = 'hidden';
-                input.name = 'accounts';
-                input.value = token;
-                form.appendChild(input);
+    function renderPanels(panels) {
+        const grid = document.getElementById('farm-grid');
+        grid.innerHTML = '';
+        if (!panels) return;
+
+        panels.forEach(panel => {
+            const panelEl = document.createElement('div');
+            panelEl.className = 'panel';
+            panelEl.dataset.id = panel.id;
+
+            let accountOptions = '<option value="">-- Chọn tài khoản --</option>';
+            {{ GLOBAL_ACCOUNTS_JSON | safe }}.forEach(acc => {
+                accountOptions += `<option value="${acc.token}">${acc.name}</option>`;
             });
-        }
+            
+            let accountSlotsHTML = '';
+            for (let i = 1; i <= 6; i++) {
+                const slotKey = `slot_${i}`;
+                const selectedToken = panel.accounts[slotKey] || '';
+                accountSlotsHTML += `
+                    <div class="input-group">
+                        <label>Slot ${i}</label>
+                        <select class="account-selector" data-slot="${slotKey}">
+                            ${accountOptions}
+                        </select>
+                    </div>
+                `;
+            }
+
+            panelEl.innerHTML = `
+                <div class="panel-header">
+                    <h3 contenteditable="true" class="panel-name">${panel.name}</h3>
+                    <button class="btn btn-danger btn-sm delete-panel-btn"><i class="fas fa-trash"></i></button>
+                </div>
+                <div class="input-group">
+                    <label>Channel ID</label>
+                    <input type="text" class="channel-id-input" value="${panel.channel_id}">
+                </div>
+                <div class="account-slots">${accountSlotsHTML}</div>
+            `;
+            grid.appendChild(panelEl);
+            
+            // Set selected values for dropdowns after they are in the DOM
+            for (let i = 1; i <= 6; i++) {
+                const slotKey = `slot_${i}`;
+                const selectedToken = panel.accounts[slotKey] || '';
+                panelEl.querySelector(`select[data-slot="${slotKey}"]`).value = selectedToken;
+            }
+        });
+    }
+
+    async function refreshData() {
+        const response = await fetch('/status');
+        const data = await response.json();
         
-        // Close modal when clicking outside
-        window.onclick = function(event) {
-            const modal = document.getElementById('addChannelModal');
-            if (event.target === modal) {
-                closeModal();
+        document.getElementById('bot-status').textContent = data.bot_ready ? 'Đang hoạt động' : 'Đang kết nối...';
+        document.getElementById('total-panels').textContent = data.panels.length;
+        document.getElementById('next-slot').textContent = `Slot ${data.current_drop_slot + 1}`;
+        document.getElementById('countdown').textContent = new Date(data.countdown * 1000).toISOString().substr(14, 5);
+        renderPanels(data.panels);
+    }
+    
+    document.getElementById('add-panel-btn').addEventListener('click', async () => {
+        const name = prompt('Nhập tên cho panel mới:', 'Farm Server Mới');
+        if (name) {
+            await apiCall('POST', { name });
+            refreshData();
+        }
+    });
+
+    document.getElementById('farm-grid').addEventListener('click', async (e) => {
+        if (e.target.closest('.delete-panel-btn')) {
+            const panelEl = e.target.closest('.panel');
+            const panelId = panelEl.dataset.id;
+            if (confirm(`Bạn có chắc muốn xóa panel "${panelEl.querySelector('.panel-name').textContent}"?`)) {
+                await apiCall('DELETE', { id: panelId });
+                refreshData();
             }
         }
-    </script>
+    });
+
+    document.getElementById('farm-grid').addEventListener('change', async (e) => {
+        const panelEl = e.target.closest('.panel');
+        if (!panelEl) return;
+        const panelId = panelEl.dataset.id;
+        
+        const payload = { id: panelId, update: {} };
+        
+        if (e.target.classList.contains('channel-id-input')) {
+            payload.update.channel_id = e.target.value.trim();
+        } else if (e.target.classList.contains('account-selector')) {
+            const slot = e.target.dataset.slot;
+            const token = e.target.value;
+            payload.update.accounts = { [slot]: token };
+        } else {
+            return;
+        }
+
+        await apiCall('PUT', payload);
+        // No need to refresh, the change is already reflected in the UI. 
+        // We can add a visual confirmation if needed.
+    });
+    
+    document.getElementById('farm-grid').addEventListener('blur', async (e) => {
+        if (e.target.classList.contains('panel-name')) {
+             const panelEl = e.target.closest('.panel');
+             const panelId = panelEl.dataset.id;
+             const newName = e.target.textContent.trim();
+             await apiCall('PUT', { id: panelId, update: { name: newName } });
+        }
+    }, true);
+
+
+    setInterval(refreshData, 2000);
+    refreshData();
+});
+</script>
 </body>
 </html>
-'''
+"""
 
-# Tạo template directory nếu chưa có
-import os
-os.makedirs('templates', exist_ok=True)
+@app.route("/")
+def index():
+    # Chuyển danh sách tài khoản sang dạng JSON để nhúng vào template HTML
+    global_accounts_json = json.dumps([{"name": acc["name"], "token": acc["token"]} for acc in GLOBAL_ACCOUNTS])
+    return render_template_string(HTML_TEMPLATE, GLOBAL_ACCOUNTS_JSON=global_accounts_json)
 
-# Ghi file template
-with open('templates/index.html', 'w', encoding='utf-8') as f:
-    f.write(HTML_TEMPLATE)
+@app.route("/api/panels", methods=['GET', 'POST', 'PUT', 'DELETE'])
+def handle_panels():
+    global panels
+    if request.method == 'GET':
+        return jsonify(panels)
 
-# --- Main execution ---
-if __name__ == "__main__":
-    # Load panels từ file
-    load_panels()
+    elif request.method == 'POST':
+        data = request.get_json()
+        name = data.get('name')
+        if not name: return jsonify({"error": "Tên là bắt buộc"}), 400
+        new_panel = {
+            "id": f"panel_{int(time.time())}",
+            "name": name,
+            "channel_id": "",
+            "accounts": {f"slot_{i}": "" for i in range(1, 7)}
+        }
+        panels.append(new_panel)
+        save_panels()
+        return jsonify(new_panel), 201
+
+    elif request.method == 'PUT':
+        data = request.get_json()
+        panel_id = data.get('id')
+        update_data = data.get('update')
+        panel_to_update = next((p for p in panels if p.get('id') == panel_id), None)
+        if not panel_to_update: return jsonify({"error": "Không tìm thấy panel"}), 404
+        
+        if 'name' in update_data: panel_to_update['name'] = update_data['name']
+        if 'channel_id' in update_data: panel_to_update['channel_id'] = update_data['channel_id']
+        if 'accounts' in update_data:
+            for slot, token in update_data['accounts'].items():
+                panel_to_update['accounts'][slot] = token
+
+        save_panels()
+        return jsonify(panel_to_update)
+
+    elif request.method == 'DELETE':
+        data = request.get_json()
+        panel_id = data.get('id')
+        panels = [p for p in panels if p.get('id') != panel_id]
+        save_panels()
+        return jsonify({"message": "Đã xóa panel"}), 200
+
+@app.route("/status")
+def status():
+    # Tính toán thời gian còn lại cho lần drop kế tiếp
+    # Đây là ước tính, không chính xác 100% nhưng đủ cho UI
+    # Lấy thời gian từ lần chạy cuối của vòng lặp chính
+    loop = asyncio.get_event_loop()
+    tasks = [t for t in asyncio.all_tasks(loop) if t.get_name() == 'drop_sender_loop']
+    countdown = 305
+    # Logic tính toán countdown phức tạp, tạm thời trả về giá trị tĩnh
+    # Để chính xác hơn cần chia sẻ state giữa luồng asyncio và flask
     
-    # Chạy Flask app
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    return jsonify({
+        "bot_ready": bot_ready,
+        "panels": panels,
+        "current_drop_slot": current_drop_slot,
+        "countdown": countdown, 
+    })
+
+
+# --- HÀM KHỞI CHẠY CHÍNH ---
+async def main():
+    if not TOKENS_STR:
+        print("Lỗi: Biến môi trường TOKENS chưa được thiết lập. Vui lòng thêm token vào file .env.")
+        return
+
+    # Tải cấu hình đã lưu
+    load_panels()
+
+    # Khởi chạy web server trong một luồng riêng
+    def run_flask():
+        # Sử dụng waitress thay cho server mặc định của Flask để tốt hơn cho production
+        from waitress import serve
+        port = int(os.environ.get("PORT", 10000))
+        print(f"Khởi động Web Server tại http://0.0.0.0:{port}")
+        serve(app, host="0.0.0.0", port=port)
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Tạo các task asyncio chính
+    sender_task = asyncio.create_task(drop_sender_loop(), name='drop_sender_loop')
+    listener_task = asyncio.create_task(run_listener_bot(), name='listener_bot')
+
+    await asyncio.gather(sender_task, listener_task)
+
+
+if __name__ == "__main__":
+    # Cài đặt thư viện cần thiết
+    try:
+        import waitress
+    except ImportError:
+        print("Đang cài đặt waitress...")
+        os.system('pip install waitress')
+        
+    asyncio.run(main())
