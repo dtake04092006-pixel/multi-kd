@@ -473,28 +473,30 @@ document.addEventListener('DOMContentLoaded', function () {
         const panelId = panelEl.dataset.id;
     
         const payload = { id: panelId, update: {} };
-        let shouldUpdateUI = false;
     
         if (e.target.classList.contains('channel-id-input')) {
             payload.update.channel_id = e.target.value.trim();
-            shouldUpdateUI = true;
+            
+            // Gửi API call để LƯU và LẤY tên server
+            const updatedPanel = await apiCall('PUT', payload);
+    
+            // Cập nhật tên server ngay lập tức
+            if (updatedPanel) {
+                const serverNameEl = panelEl.querySelector('.server-name-display');
+                if (serverNameEl) {
+                    serverNameEl.textContent = updatedPanel.server_name || '(Không tìm thấy server)';
+                }
+            }
         } else if (e.target.classList.contains('account-selector')) {
             const slot = e.target.dataset.slot;
             const token = e.target.value;
             payload.update.accounts = { [slot]: token };
+
+            // BƯỚC 1: Gửi API call để LƯU lựa chọn mới
+            await apiCall('PUT', payload);
+
+            // BƯỚC 2: SAU KHI LƯU, vẽ lại tất cả các panel để cập nhật giao diện và danh sách ẩn
             fetchAndRenderPanels();
-            return; // Return early as fetchAndRenderPanels will handle the UI
-        } else {
-            return;
-        }
-    
-        const updatedPanel = await apiCall('PUT', payload);
-    
-        if (shouldUpdateUI && updatedPanel) {
-            const serverNameEl = panelEl.querySelector('.server-name-display');
-            if (serverNameEl) {
-                serverNameEl.textContent = updatedPanel.server_name || '(Không tìm thấy server)';
-            }
         }
     });
     
