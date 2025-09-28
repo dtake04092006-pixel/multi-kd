@@ -116,6 +116,39 @@ def load_panels():
     except Exception as e:
         print(f"[Settings] Exception khi tải cài đặt: {e}")
 
+def get_server_name_from_channel(channel_id):
+    """Lấy tên server từ Channel ID thông qua Discord API."""
+    if not channel_id or not channel_id.isdigit():
+        return "ID kênh không hợp lệ"
+    if not GLOBAL_ACCOUNTS:
+        return "Không có token để xác thực"
+
+    # Sử dụng token đầu tiên để thực hiện request
+    token = GLOBAL_ACCOUNTS[0]["token"]
+    headers = {"Authorization": token}
+
+    try:
+        # Lấy thông tin kênh để tìm Guild ID
+        channel_res = requests.get(f"https://discord.com/api/v9/channels/{channel_id}", headers=headers, timeout=10)
+        if channel_res.status_code != 200:
+            return "Không tìm thấy kênh"
+
+        channel_data = channel_res.json()
+        guild_id = channel_data.get("guild_id")
+
+        if not guild_id:
+            return "Đây là kênh DM/Group"
+
+        # Lấy thông tin server từ Guild ID
+        guild_res = requests.get(f"https://discord.com/api/v9/guilds/{guild_id}", headers=headers, timeout=10)
+        if guild_res.status_code == 200:
+            return guild_res.json().get("name", "Không thể lấy tên server")
+        else:
+            return "Không thể truy cập server"
+
+    except requests.RequestException:
+        return "Lỗi mạng"
+        
 
 # --- LOGIC BOT CHÍNH ---
 
@@ -282,6 +315,13 @@ HTML_TEMPLATE = """
         .input-group label { display: block; color: var(--text-secondary); margin-bottom: 5px; font-size: 0.9em; }
         .input-group input, .input-group select { width: 100%; background-color: var(--primary-bg); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 5px; box-sizing: border-box; }
         .account-slots { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        .server-name-display { 
+            font-size: 0.8em; 
+            color: var(--text-secondary); 
+            margin-top: 5px; 
+            display: block;
+            height: 1.2em;
+        }
     </style>
 </head>
 <body>
@@ -337,8 +377,8 @@ document.addEventListener('DOMContentLoaded', function () {
         const grid = document.getElementById('farm-grid');
         grid.innerHTML = '';
         if (!panels) return;
-
-        // BƯỚC 1: Tạo một danh sách (Set) chứa tất cả token đã được sử dụng trên toàn bộ các panel.
+    
+        // Tạo một danh sách (Set) chứa tất cả token đã được sử dụng trên toàn bộ các panel.
         const usedTokens = new Set();
         panels.forEach(p => {
             Object.values(p.accounts).forEach(token => {
@@ -347,16 +387,16 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
             });
         });
-
-        // BƯỚC 2: Duyệt qua từng panel để vẽ ra giao diện.
+    
+        // Duyệt qua từng panel để vẽ ra giao diện.
         panels.forEach(panel => {
             const panelEl = document.createElement('div');
             panelEl.className = 'panel';
             panelEl.dataset.id = panel.id;
-
+    
             let accountSlotsHTML = '';
             
-            // BƯỚC 3: Với mỗi slot trong panel, tạo một danh sách lựa chọn riêng.
+            // Với mỗi slot trong panel, tạo một danh sách lựa chọn riêng.
             for (let i = 1; i <= 6; i++) {
                 const slotKey = `slot_${i}`;
                 const currentTokenForSlot = panel.accounts[slotKey] || '';
@@ -372,7 +412,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         uniqueAccountOptions += `<option value="${acc.token}">${acc.name}</option>`;
                     }
                 });
-
+    
                 accountSlotsHTML += `
                     <div class="input-group">
                         <label>Slot ${i}</label>
@@ -382,7 +422,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     </div>
                 `;
             }
-
+    
             // Dựng lại HTML cho panel với các ô lựa chọn đã được tùy biến
             panelEl.innerHTML = `
                 <div class="panel-header">
@@ -392,6 +432,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 <div class="input-group">
                     <label>Channel ID</label>
                     <input type="text" class="channel-id-input" value="${panel.channel_id || ''}">
+                    <small class="server-name-display">${panel.server_name || '(Tên server sẽ hiện ở đây)'}</small>
                 </div>
                 <div class="account-slots">${accountSlotsHTML}</div>
             `;
@@ -464,19 +505,32 @@ document.addEventListener('DOMContentLoaded', function () {
         const panelEl = e.target.closest('.panel');
         if (!panelEl) return;
         const panelId = panelEl.dataset.id;
-        
+    
         const payload = { id: panelId, update: {} };
-        
+        let shouldUpdateUI = false;
+    
         if (e.target.classList.contains('channel-id-input')) {
             payload.update.channel_id = e.target.value.trim();
+            shouldUpdateUI = true;
         } else if (e.target.classList.contains('account-selector')) {
             const slot = e.target.dataset.slot;
             const token = e.target.value;
             payload.update.accounts = { [slot]: token };
+            // Khi đổi tài khoản, cần vẽ lại toàn bộ để cập nhật danh sách ẩn
+            fetchAndRenderPanels();
         } else {
             return;
         }
-        await apiCall('PUT', payload);
+    
+        const updatedPanel = await apiCall('PUT', payload);
+    
+        // Cập nhật tên server ngay lập tức mà không cần refresh toàn bộ
+        if (shouldUpdateUI && updatedPanel) {
+            const serverNameEl = panelEl.querySelector('.server-name-display');
+            if (serverNameEl) {
+                serverNameEl.textContent = updatedPanel.server_name || '(Không tìm thấy server)';
+            }
+        }
     });
     
     document.getElementById('farm-grid').addEventListener('blur', async (e) => {
@@ -527,6 +581,7 @@ def handle_panels():
             "id": f"panel_{int(time.time())}",
             "name": name,
             "channel_id": "",
+            "server_name": "", # Thêm trường mới
             "accounts": {f"slot_{i}": "" for i in range(1, 7)}
         }
         panels.append(new_panel)
@@ -539,14 +594,24 @@ def handle_panels():
         update_data = data.get('update')
         panel_to_update = next((p for p in panels if p.get('id') == panel_id), None)
         if not panel_to_update: return jsonify({"error": "Không tìm thấy panel"}), 404
-        
+
         if 'name' in update_data: panel_to_update['name'] = update_data['name']
-        if 'channel_id' in update_data: panel_to_update['channel_id'] = update_data['channel_id']
+
+        # --- PHẦN SỬA ĐỔI QUAN TRỌNG ---
+        if 'channel_id' in update_data:
+            new_channel_id = update_data['channel_id'].strip()
+            panel_to_update['channel_id'] = new_channel_id
+            # Gọi hàm để lấy tên server và lưu lại
+            server_name = get_server_name_from_channel(new_channel_id)
+            panel_to_update['server_name'] = server_name
+        # --- KẾT THÚC SỬA ĐỔI ---
+
         if 'accounts' in update_data:
             for slot, token in update_data['accounts'].items():
                 panel_to_update['accounts'][slot] = token
 
         save_panels()
+        # Trả về toàn bộ panel đã được cập nhật (bao gồm cả server_name mới)
         return jsonify(panel_to_update)
 
     elif request.method == 'DELETE':
@@ -555,7 +620,7 @@ def handle_panels():
         panels = [p for p in panels if p.get('id') != panel_id]
         save_panels()
         return jsonify({"message": "Đã xóa panel"}), 200
-
+        
 @app.route("/status")
 def status():
     # Chỉ trả về các thông tin an toàn, không truy cập vào asyncio
