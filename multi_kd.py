@@ -338,29 +338,52 @@ document.addEventListener('DOMContentLoaded', function () {
         grid.innerHTML = '';
         if (!panels) return;
 
+        // BƯỚC 1: Tạo một danh sách (Set) chứa tất cả token đã được sử dụng trên toàn bộ các panel.
+        const usedTokens = new Set();
+        panels.forEach(p => {
+            Object.values(p.accounts).forEach(token => {
+                if (token) { // Chỉ thêm nếu slot có chọn tài khoản
+                    usedTokens.add(token);
+                }
+            });
+        });
+
+        // BƯỚC 2: Duyệt qua từng panel để vẽ ra giao diện.
         panels.forEach(panel => {
             const panelEl = document.createElement('div');
             panelEl.className = 'panel';
             panelEl.dataset.id = panel.id;
 
-            let accountOptions = '<option value="">-- Chọn tài khoản --</option>';
-            {{ GLOBAL_ACCOUNTS_JSON | safe }}.forEach(acc => {
-                accountOptions += `<option value="${acc.token}">${acc.name}</option>`;
-            });
-            
             let accountSlotsHTML = '';
+            
+            // BƯỚC 3: Với mỗi slot trong panel, tạo một danh sách lựa chọn riêng.
             for (let i = 1; i <= 6; i++) {
                 const slotKey = `slot_${i}`;
+                const currentTokenForSlot = panel.accounts[slotKey] || '';
+                
+                let uniqueAccountOptions = '<option value="">-- Chọn tài khoản --</option>';
+                
+                // Lọc qua danh sách tài khoản tổng.
+                {{ GLOBAL_ACCOUNTS_JSON | safe }}.forEach(acc => {
+                    // MỘT TÀI KHOẢN SẼ ĐƯỢC HIỂN THỊ NẾU:
+                    // 1. Token của nó KHÔNG nằm trong danh sách đã sử dụng.
+                    // 2. HOẶC token của nó chính là token đang được chọn cho chính slot này (để nó không tự ẩn đi).
+                    if (!usedTokens.has(acc.token) || acc.token === currentTokenForSlot) {
+                        uniqueAccountOptions += `<option value="${acc.token}">${acc.name}</option>`;
+                    }
+                });
+
                 accountSlotsHTML += `
                     <div class="input-group">
                         <label>Slot ${i}</label>
                         <select class="account-selector" data-slot="${slotKey}">
-                            ${accountOptions}
+                            ${uniqueAccountOptions}
                         </select>
                     </div>
                 `;
             }
 
+            // Dựng lại HTML cho panel với các ô lựa chọn đã được tùy biến
             panelEl.innerHTML = `
                 <div class="panel-header">
                     <h3 contenteditable="true" class="panel-name">${panel.name}</h3>
@@ -374,6 +397,7 @@ document.addEventListener('DOMContentLoaded', function () {
             `;
             grid.appendChild(panelEl);
             
+            // Đặt lại giá trị đã chọn cho các ô select sau khi chúng đã được thêm vào trang
             for (let i = 1; i <= 6; i++) {
                 const slotKey = `slot_${i}`;
                 const selectedToken = panel.accounts[slotKey] || '';
