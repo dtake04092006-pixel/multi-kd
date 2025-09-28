@@ -35,6 +35,7 @@ panels = []
 current_drop_slot = 0 # Slot đang trong lượt drop (0-5)
 bot_ready = False
 listener_bot = None
+is_kd_loop_enabled = True
 
 # --- CÁC HÀM TIỆN ÍCH & API DISCORD ---
 
@@ -127,6 +128,12 @@ async def drop_sender_loop():
     print("Bot đã sẵn sàng. Bắt đầu vòng lặp gửi 'kd'.")
 
     while True:
+        
+         if not is_kd_loop_enabled:
+            # Nếu bị tắt, vòng lặp sẽ dừng ở đây và kiểm tra lại sau mỗi 5 giây
+            await asyncio.sleep(5)
+            continue # Bỏ qua phần còn lại và lặp lại
+             
         try:
             slot_key = f"slot_{current_drop_slot + 1}"
             print(f"\n--- Đang trong lượt của Slot {current_drop_slot + 1} ---")
@@ -295,6 +302,10 @@ HTML_TEMPLATE = """
         <div class="controls">
             <button id="add-panel-btn" class="btn"><i class="fas fa-plus"></i> Thêm Panel Mới</button>
         </div>
+        <div class="controls">
+            <button id="add-panel-btn" class="btn"><i class="fas fa-plus"></i> Thêm Panel Mới</button>
+            <button id="toggle-kd-btn" class="btn" style="margin-left: 15px;"></button>
+        </div>    
 
         <div id="farm-grid" class="farm-grid">
             </div>
@@ -380,6 +391,17 @@ document.addEventListener('DOMContentLoaded', function () {
         document.getElementById('total-panels').textContent = data.panels.length;
         document.getElementById('next-slot').textContent = `Slot ${data.current_drop_slot + 1}`;
         document.getElementById('countdown').textContent = new Date(data.countdown * 1000).toISOString().substr(14, 5);
+        
+        const toggleBtn = document.getElementById('toggle-kd-btn');
+        if (data.is_kd_loop_enabled) {
+            toggleBtn.textContent = 'TẮT VÒNG LẶP KD';
+            toggleBtn.classList.remove('btn-danger');
+            document.getElementById('next-slot').style.color = 'var(--accent-color)';
+        } else {
+            toggleBtn.textContent = 'BẬT VÒNG LẶP KD';
+            toggleBtn.classList.add('btn-danger');
+            document.getElementById('next-slot').style.color = 'var(--danger-color)';
+        }
         renderPanels(data.panels);
     }
     
@@ -432,7 +454,11 @@ document.addEventListener('DOMContentLoaded', function () {
              await apiCall('PUT', { id: panelId, update: { name: newName } });
         }
     }, true);
-
+    
+    document.getElementById('toggle-kd-btn').addEventListener('click', async () => {
+        await fetch('/api/toggle_kd', { method: 'POST' });
+        refreshData(); // Cập nhật lại giao diện ngay lập tức
+    });
 
     setInterval(refreshData, 2000);
     refreshData();
@@ -499,8 +525,15 @@ def status():
         "panels": panels,
         "current_drop_slot": current_drop_slot,
         "countdown": 305, # Tạm thời trả về giá trị tĩnh
+        "is_kd_loop_enabled": is_kd_loop_enabled
     })
-
+    
+@app.route("/api/toggle_kd", methods=['POST'])
+def toggle_kd():
+    global is_kd_loop_enabled
+    is_kd_loop_enabled = not is_kd_loop_enabled
+    state = "BẬT" if is_kd_loop_enabled else "TẮT"
+    return jsonify({"message": f"Vòng lặp gửi 'kd' đã được {state}.", "is_enabled": is_kd_loop_enabled})
 
 # --- HÀM KHỞI CHẠY CHÍNH ---
 async def main():
