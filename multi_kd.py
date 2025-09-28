@@ -493,20 +493,12 @@ def handle_panels():
 
 @app.route("/status")
 def status():
-    # Tính toán thời gian còn lại cho lần drop kế tiếp
-    # Đây là ước tính, không chính xác 100% nhưng đủ cho UI
-    # Lấy thời gian từ lần chạy cuối của vòng lặp chính
-    loop = asyncio.get_event_loop()
-    tasks = [t for t in asyncio.all_tasks(loop) if t.get_name() == 'drop_sender_loop']
-    countdown = 305
-    # Logic tính toán countdown phức tạp, tạm thời trả về giá trị tĩnh
-    # Để chính xác hơn cần chia sẻ state giữa luồng asyncio và flask
-    
+    # Chỉ trả về các thông tin an toàn, không truy cập vào asyncio
     return jsonify({
         "bot_ready": bot_ready,
         "panels": panels,
         "current_drop_slot": current_drop_slot,
-        "countdown": countdown, 
+        "countdown": 305, # Tạm thời trả về giá trị tĩnh
     })
 
 
