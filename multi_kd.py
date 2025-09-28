@@ -349,7 +349,6 @@ document.addEventListener('DOMContentLoaded', function () {
             let accountSlotsHTML = '';
             for (let i = 1; i <= 6; i++) {
                 const slotKey = `slot_${i}`;
-                const selectedToken = panel.accounts[slotKey] || '';
                 accountSlotsHTML += `
                     <div class="input-group">
                         <label>Slot ${i}</label>
@@ -367,13 +366,12 @@ document.addEventListener('DOMContentLoaded', function () {
                 </div>
                 <div class="input-group">
                     <label>Channel ID</label>
-                    <input type="text" class="channel-id-input" value="${panel.channel_id}">
+                    <input type="text" class="channel-id-input" value="${panel.channel_id || ''}">
                 </div>
                 <div class="account-slots">${accountSlotsHTML}</div>
             `;
             grid.appendChild(panelEl);
             
-            // Set selected values for dropdowns after they are in the DOM
             for (let i = 1; i <= 6; i++) {
                 const slotKey = `slot_${i}`;
                 const selectedToken = panel.accounts[slotKey] || '';
@@ -381,8 +379,11 @@ document.addEventListener('DOMContentLoaded', function () {
             }
         });
     }
+    
+    // --- PHẦN SỬA LỖI NẰM Ở ĐÂY ---
 
-    async function refreshData() {
+    // Hàm này chỉ cập nhật các text trạng thái, không vẽ lại panel
+    async function updateStatus() {
         const response = await fetch('/status');
         const data = await response.json();
         
@@ -390,17 +391,25 @@ document.addEventListener('DOMContentLoaded', function () {
         document.getElementById('total-panels').textContent = data.panels.length;
         document.getElementById('next-slot').textContent = `Slot ${data.current_drop_slot + 1}`;
         document.getElementById('countdown').textContent = new Date(data.countdown * 1000).toISOString().substr(14, 5);
-        
+
         const toggleBtn = document.getElementById('toggle-kd-btn');
-        if (data.is_kd_loop_enabled) {
-            toggleBtn.textContent = 'TẮT VÒNG LẶP KD';
-            toggleBtn.classList.remove('btn-danger');
-            document.getElementById('next-slot').style.color = 'var(--accent-color)';
-        } else {
-            toggleBtn.textContent = 'BẬT VÒNG LẶP KD';
-            toggleBtn.classList.add('btn-danger');
-            document.getElementById('next-slot').style.color = 'var(--danger-color)';
+        if (toggleBtn) { // Kiểm tra nếu nút tồn tại
+            if (data.is_kd_loop_enabled) {
+                toggleBtn.textContent = 'TẮT VÒNG LẶP KD';
+                toggleBtn.classList.remove('btn-danger');
+                document.getElementById('next-slot').style.color = 'var(--accent-color)';
+            } else {
+                toggleBtn.textContent = 'BẬT VÒNG LẶP KD';
+                toggleBtn.classList.add('btn-danger');
+                document.getElementById('next-slot').style.color = 'var(--danger-color)';
+            }
         }
+    }
+
+    // Hàm này fetch và vẽ lại toàn bộ panel
+    async function fetchAndRenderPanels() {
+        const response = await fetch('/status');
+        const data = await response.json();
         renderPanels(data.panels);
     }
     
@@ -408,7 +417,7 @@ document.addEventListener('DOMContentLoaded', function () {
         const name = prompt('Nhập tên cho panel mới:', 'Farm Server Mới');
         if (name) {
             await apiCall('POST', { name });
-            refreshData();
+            fetchAndRenderPanels(); // Chỉ vẽ lại panel khi thêm
         }
     });
 
@@ -418,10 +427,13 @@ document.addEventListener('DOMContentLoaded', function () {
             const panelId = panelEl.dataset.id;
             if (confirm(`Bạn có chắc muốn xóa panel "${panelEl.querySelector('.panel-name').textContent}"?`)) {
                 await apiCall('DELETE', { id: panelId });
-                refreshData();
+                fetchAndRenderPanels(); // Chỉ vẽ lại panel khi xóa
             }
         }
     });
+    
+    // --- HẾT PHẦN SỬA LỖI ---
+
 
     document.getElementById('farm-grid').addEventListener('change', async (e) => {
         const panelEl = e.target.closest('.panel');
@@ -441,8 +453,6 @@ document.addEventListener('DOMContentLoaded', function () {
         }
 
         await apiCall('PUT', payload);
-        // No need to refresh, the change is already reflected in the UI. 
-        // We can add a visual confirmation if needed.
     });
     
     document.getElementById('farm-grid').addEventListener('blur', async (e) => {
@@ -453,14 +463,17 @@ document.addEventListener('DOMContentLoaded', function () {
              await apiCall('PUT', { id: panelId, update: { name: newName } });
         }
     }, true);
-    
-    document.getElementById('toggle-kd-btn').addEventListener('click', async () => {
-        await fetch('/api/toggle_kd', { method: 'POST' });
-        refreshData(); // Cập nhật lại giao diện ngay lập tức
-    });
 
-    setInterval(refreshData, 2000);
-    refreshData();
+    const toggleBtn = document.getElementById('toggle-kd-btn');
+    if (toggleBtn) {
+        toggleBtn.addEventListener('click', async () => {
+            await fetch('/api/toggle_kd', { method: 'POST' });
+            updateStatus();
+        });
+    }
+
+    setInterval(updateStatus, 2000); // Bây giờ chỉ cập nhật status, không vẽ lại panel
+    fetchAndRenderPanels(); // Vẽ các panel lần đầu khi tải trang
 });
 </script>
 </body>
