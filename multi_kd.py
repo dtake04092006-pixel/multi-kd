@@ -128,12 +128,11 @@ async def drop_sender_loop():
     print("Bot đã sẵn sàng. Bắt đầu vòng lặp gửi 'kd'.")
 
     while True:
-        
-         if not is_kd_loop_enabled:
+        if not is_kd_loop_enabled:
             # Nếu bị tắt, vòng lặp sẽ dừng ở đây và kiểm tra lại sau mỗi 5 giây
             await asyncio.sleep(5)
             continue # Bỏ qua phần còn lại và lặp lại
-             
+        
         try:
             slot_key = f"slot_{current_drop_slot + 1}"
             print(f"\n--- Đang trong lượt của Slot {current_drop_slot + 1} ---")
