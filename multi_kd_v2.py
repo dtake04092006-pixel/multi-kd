@@ -1,5 +1,5 @@
 # TÊN FILE: main.py
-# PHIÊN BẢN: Multi-Farm Deep Control v2.1 (3-Slot)
+# PHIÊN BẢN: Multi-Farm Deep Control v2.2 (All-Online)
 import discord
 from discord.ext import commands
 import asyncio
@@ -33,41 +33,48 @@ for i, token in enumerate(tokens_list):
 # Biến trạng thái, sẽ được load từ JSONBin
 panels = []
 current_drop_slot = 0 # Slot đang trong lượt drop (0-2)
-bot_ready = False
-listener_bot = None
 is_kd_loop_enabled = True
 
-# --- CÁC HÀM TIỆN ÍCH & API DISCORD ---
+# Biến trạng thái bot MỚI
+bot_ready = False # Sẽ là True khi TẤT CẢ các bot đã sẵn sàng
+GLOBAL_BOTS = {} # Map: token -> bot_instance
+bot_ready_flags = {} # Map: token -> bool (để theo dõi từng bot)
+last_kd_cycle_time = 0 # Thời gian của lần gửi 'kd' cuối
 
-def send_message_http(token, channel_id, content):
-    """Gửi tin nhắn đến một kênh bằng requests, không cần bot instance."""
-    if not token or not channel_id: return
-    headers = {"Authorization": token}
-    payload = {"content": content}
-    url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
+
+# --- CÁC HÀM TIỆN ÍCH & API DISCORD (ĐÃ THAY ĐỔI) ---
+
+async def send_message_bot(bot_instance, channel_id, content):
+    """Gửi tin nhắn bằng bot instance (thay vì HTTP)."""
+    if not bot_instance or not channel_id: return
     try:
-        res = requests.post(url, headers=headers, json=payload, timeout=10)
-        if res.status_code == 200:
-            print(f"[HTTP SEND] Gửi '{content}' tới kênh {channel_id} thành công.")
+        channel = bot_instance.get_channel(int(channel_id))
+        if channel:
+            await channel.send(content)
+            print(f"[{bot_instance.user.name}] Gửi '{content}' tới kênh {channel_id} thành công.")
         else:
-            print(f"[HTTP SEND ERROR] Lỗi khi gửi tin nhắn tới kênh {channel_id}: {res.status_code} {res.text}")
+            # Bot không thể thấy kênh này, có thể do lỗi phân quyền
+            print(f"[{bot_instance.user.name}] Lỗi: Không tìm thấy kênh {channel_id}.")
+    except discord.errors.Forbidden:
+        print(f"[{bot_instance.user.name}] Lỗi: Không có quyền gửi tin nhắn tới kênh {channel_id}.")
     except Exception as e:
-        print(f"[HTTP SEND EXCEPTION] Lỗi ngoại lệ khi gửi tin nhắn: {e}")
+        print(f"[{bot_instance.user.name}] Lỗi ngoại lệ khi gửi tin nhắn: {e}")
 
-def add_reaction_http(token, channel_id, message_id, emoji):
-    """Thả reaction vào tin nhắn bằng requests."""
-    if not token or not channel_id: return
-    headers = {"Authorization": token}
-    encoded_emoji = requests.utils.quote(emoji)
-    url = f"https://discord.com/api/v9/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me"
+async def add_reaction_bot(bot_instance, channel_id, message_id, emoji):
+    """Thả reaction bằng bot instance (thay vì HTTP)."""
+    if not bot_instance or not channel_id: return
     try:
-        res = requests.put(url, headers=headers, timeout=10)
-        if res.status_code != 204:
-             print(f"[HTTP REACT ERROR] Lỗi khi thả reaction {emoji} tới kênh {channel_id}: {res.status_code} {res.text}")
+        # Sử dụng bot.http.add_reaction đáng tin cậy hơn
+        await bot_instance.http.add_reaction(channel_id, message_id, emoji)
+        # print(f"[{bot_instance.user.name}] Thả reaction {emoji} thành công.")
+    except discord.errors.Forbidden:
+        print(f"[{bot_instance.user.name}] Lỗi: Không có quyền thả reaction tại {channel_id}.")
     except Exception as e:
-        print(f"[HTTP REACT EXCEPTION] Lỗi ngoại lệ khi thả reaction: {e}")
+        print(f"[{bot_instance.user.name}] Lỗi ngoại lệ khi thả reaction: {e}")
+
 
 # --- LƯU & TẢI CẤU HÌNH PANEL ---
+# (Không thay đổi - Giữ nguyên các hàm save_panels, load_panels, get_server_name_from_channel)
 def save_panels():
     """Lưu cấu hình các panel lên JSONBin.io"""
     api_key = os.getenv("JSONBIN_API_KEY")
@@ -108,20 +115,20 @@ def load_panels():
                 panels = data
                 print(f"[Settings] Đã tải {len(panels)} panel từ JSONBin.io.")
             else:
-                save_panels()
+                save_panels() # Nếu dữ liệu rỗng hoặc sai, tạo mới
         else:
             print(f"[Settings] Lỗi khi tải cài đặt: {req.status_code} - {req.text}")
     except Exception as e:
         print(f"[Settings] Exception khi tải cài đặt: {e}")
 
 def get_server_name_from_channel(channel_id):
-    """Lấy tên server từ Channel ID thông qua Discord API."""
+    """Lấy tên server từ Channel ID thông qua Discord API. (Vẫn dùng HTTP cho việc này vì nó chạy trong thread Flask)"""
     if not channel_id or not channel_id.isdigit():
         return "ID kênh không hợp lệ"
     if not GLOBAL_ACCOUNTS:
         return "Không có token để xác thực"
 
-    token = GLOBAL_ACCOUNTS[0]["token"]
+    token = GLOBAL_ACCOUNTS[0]["token"] # Dùng token đầu tiên để check
     headers = {"Authorization": token}
 
     try:
@@ -143,124 +150,122 @@ def get_server_name_from_channel(channel_id):
 
     except requests.RequestException:
         return "Lỗi mạng"
-        
-# --- LOGIC BOT CHÍNH ---
 
-async def drop_sender_loop():
-    """Vòng lặp gửi 'kd', luân phiên giữa các slot tài khoản."""
-    global current_drop_slot
-    print("Vòng lặp gửi 'kd' đang chờ bot sẵn sàng...")
-    while not bot_ready:
-        await asyncio.sleep(1)
-    print("Bot đã sẵn sàng. Bắt đầu vòng lặp gửi 'kd'.")
+# --- LOGIC BOT CHÍNH (ĐÃ THAY ĐỔI) ---
 
-    while True:
-        if not is_kd_loop_enabled:
-            await asyncio.sleep(5)
-            continue
-        
-        try:
-            slot_key = f"slot_{current_drop_slot + 1}"
-            print(f"\n--- Đang trong lượt của Slot {current_drop_slot + 1} ---")
-
-            tasks = []
-            active_sends = 0
-            for panel in panels:
-                channel_id = panel.get("channel_id")
-                token_to_use = panel.get("accounts", {}).get(slot_key)
-
-                if token_to_use and channel_id:
-                    task = asyncio.to_thread(send_message_http, token_to_use, channel_id, "kd")
-                    tasks.append(task)
-                    active_sends +=1
-                
-            if tasks:
-                print(f"Gửi đồng thời {active_sends} lệnh 'kd' cho các tài khoản ở {slot_key}...")
-                await asyncio.gather(*tasks)
-            else:
-                print(f"Không có tài khoản nào được cấu hình cho {slot_key} trong bất kỳ panel nào.")
-
-            current_drop_slot = (current_drop_slot + 1) % 3
-
-            print(f"Đã xong lượt. Chờ 605 giây cho lượt kế tiếp (Slot {current_drop_slot + 1})...")
-            await asyncio.sleep(605)
-
-        except Exception as e:
-            print(f"[DROP SENDER ERROR] Lỗi nghiêm trọng trong vòng lặp gửi 'kd': {e}")
-            await asyncio.sleep(60)
+# (Hàm drop_sender_loop sẽ được định nghĩa lại bên trong main())
 
 async def handle_reactions(panel, message):
-    """Xử lý việc thả reaction cho 3 tài khoản trong một panel."""
+    """Xử lý việc thả reaction cho 3 tài khoản trong một panel. (Dùng bot instance)"""
     accounts_in_panel = panel.get("accounts", {})
     if not accounts_in_panel: return
 
     emojis = ["1️⃣", "2️⃣", "3️⃣"]
-    grab_times = [1.3, 2.3, 3.2]
+    grab_times = [1.3, 2.3, 3.2] # Giữ nguyên thời gian delay
     
     tasks = []
     for i in range(3):
         slot_key = f"slot_{i + 1}"
         token = accounts_in_panel.get(slot_key)
-        if token:
+        
+        # Lấy bot instance từ token
+        bot_to_react = GLOBAL_BOTS.get(token) 
+        
+        if bot_to_react: # Chỉ thực hiện nếu bot tồn tại và đang chạy
             delay = grab_times[i]
             emoji = emojis[i]
-            async def react_task(t, ch_id, msg_id, em, d):
-                await asyncio.sleep(d)
-                await asyncio.to_thread(add_reaction_http, t, ch_id, msg_id, em)
             
-            tasks.append(react_task(token, message.channel.id, message.id, emoji, delay))
+            async def react_task(bot, ch_id, msg_id, em, d):
+                await asyncio.sleep(d)
+                # Gọi hàm add_reaction_bot mới
+                await add_reaction_bot(bot, ch_id, msg_id, em)
+            
+            tasks.append(react_task(bot_to_react, message.channel.id, message.id, emoji, delay))
 
     if tasks:
         await asyncio.gather(*tasks)
         print(f"Đã hoàn thành các tác vụ reaction cho drop trong kênh {message.channel.id}")
 
-async def run_listener_bot():
-    """Chạy một bot duy nhất để lắng nghe sự kiện drop."""
-    global bot_ready, listener_bot
+async def run_single_bot(bot, token):
+    """Hàm trợ giúp để chạy một bot và xử lý lỗi đăng nhập."""
+    try:
+        await bot.start(token)
+    except discord.errors.LoginFailure:
+        print(f"LỖI ĐĂNG NHẬP NGHIÊM TRỌNG với token của tài khoản. Vui lòng kiểm tra lại token!")
+        bot_ready_flags[token] = False # Đánh dấu là lỗi
+    except Exception as e:
+        print(f"Lỗi không xác định với bot (Token: ...{token[-5:]}): {e}")
+        bot_ready_flags[token] = False
+
+async def run_all_bots():
+    """Khởi chạy TẤT CẢ các tài khoản dưới dạng bot client."""
+    global bot_ready, GLOBAL_BOTS, bot_ready_flags
+    
     if not GLOBAL_ACCOUNTS:
         print("Không có token nào trong biến môi trường. Bot không thể khởi động.")
         bot_ready = True
         return
+
+    print(f"Chuẩn bị khởi chạy {len(GLOBAL_ACCOUNTS)} tài khoản...")
     
-    listener_token = GLOBAL_ACCOUNTS[0]["token"]
-    
-    listener_bot = commands.Bot(command_prefix="!слушать", self_bot=True)
-
-    @listener_bot.event
-    async def on_ready():
-        global bot_ready
-        print("-" * 30)
-        print(f"BOT LẮNG NGHE ĐÃ SẴN SÀNG!")
-        print(f"Đăng nhập với tài khoản: {listener_bot.user} (ID: {listener_bot.user.id})")
-        print("Bot này chỉ dùng để nhận diện drop, các hành động khác sẽ được thực hiện qua HTTP.")
-        print("-" * 30)
-        bot_ready = True
-
-    @listener_bot.event
-    async def on_message(message):
-        if message.author.id != KARUTA_ID or "is dropping 3 cards!" not in message.content:
-            return
-
-        found_panel = None
-        for p in panels:
-            if p.get("channel_id") == str(message.channel.id):
-                found_panel = p
-                break
+    tasks = []
+    for i, acc in enumerate(GLOBAL_ACCOUNTS):
+        token = acc["token"]
+        bot_ready_flags[token] = False
         
-        if found_panel:
-            print(f"Phát hiện drop trong kênh {message.channel.id} (Panel: '{found_panel.get('name')}')")
-            asyncio.create_task(handle_reactions(found_panel, message))
+        # Tạo bot instance
+        # self_bot=True là cần thiết cho user token
+        # prefix ngẫu nhiên để tránh xung đột
+        bot = commands.Bot(command_prefix=f"!prefix_ko_dung_{random.randint(1000, 9999)}", self_bot=True)
+        GLOBAL_BOTS[token] = bot # Lưu bot instance
+        
+        # Gắn sự kiện on_ready cho TẤT CẢ các bot
+        @bot.event
+        async def on_ready(token=token): # Dùng closure để bắt giá trị token
+            global bot_ready
+            current_bot = GLOBAL_BOTS[token]
+            print(f"[BOT READY] Tài khoản '{current_bot.user.name}' (ID: {current_bot.user.id}) đã kết nối.")
+            bot_ready_flags[token] = True
+            
+            # Kiểm tra xem tất cả bot đã sẵn sàng chưa
+            if all(bot_ready_flags.values()):
+                print("-" * 30)
+                print(f"TẤT CẢ ({len(GLOBAL_BOTS)}) CÁC BOT ĐÃ SẴN SÀNG!")
+                print("-" * 30)
+                bot_ready = True # Chỉ set True khi tất cả cùng online
 
-    try:
-        await listener_bot.start(listener_token)
-    except discord.errors.LoginFailure:
-        print(f"LỖI ĐĂNG NHẬP NGHIÊM TRỌNG với token của bot lắng nghe. Vui lòng kiểm tra TOKEN đầu tiên trong file .env.")
-        bot_ready = True
-    except Exception as e:
-        print(f"Lỗi không xác định với bot lắng nghe: {e}")
-        bot_ready = True
+        # CHỈ gắn sự kiện on_message cho bot ĐẦU TIÊN (bot lắng nghe)
+        if i == 0:
+            listener_name = acc["name"]
+            print(f"-> Gắn '{listener_name}' làm BOT LẮNG NGHE CHÍNH.")
+            
+            @bot.event
+            async def on_message(message):
+                # Chỉ xử lý nếu là drop của Karuta
+                if message.author.id != KARUTA_ID or "is dropping 3 cards!" not in message.content:
+                    return
+
+                # Tìm panel tương ứng với kênh này
+                found_panel = None
+                for p in panels:
+                    if p.get("channel_id") == str(message.channel.id):
+                        found_panel = p
+                        break
+                
+                if found_panel:
+                    print(f"[LISTENER] Phát hiện drop trong kênh {message.channel.id} (Panel: '{found_panel.get('name')}')")
+                    # Tạo task để xử lý reaction, không làm nghẽn bot
+                    asyncio.create_task(handle_reactions(found_panel, message))
+
+        # Tạo task để chạy bot này
+        tasks.append(run_single_bot(bot, token))
+
+    # Chạy tất cả các bot song song
+    await asyncio.gather(*tasks)
+
 
 # --- GIAO DIỆN WEB & API FLASK ---
+# (Không thay đổi - Giữ nguyên toàn bộ phần Flask)
 app = Flask(__name__)
 
 HTML_TEMPLATE = """
@@ -375,6 +380,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 let uniqueAccountOptions = '<option value="">-- Chọn tài khoản --</option>';
                 
                 {{ GLOBAL_ACCOUNTS_JSON | safe }}.forEach(acc => {
+                    // Chỉ hiển thị token nếu nó chưa được dùng ở panel KHÁC, hoặc nó đang được dùng ở chính slot này
                     if (!usedTokens.has(acc.token) || acc.token === currentTokenForSlot) {
                         uniqueAccountOptions += `<option value="${acc.token}">${acc.name}</option>`;
                     }
@@ -443,6 +449,7 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     async function fetchAndRenderPanels() {
+        // Lấy status để có thông tin panels
         const response = await fetch('/status');
         const data = await response.json();
         renderPanels(data.panels);
@@ -527,6 +534,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
 @app.route("/")
 def index():
+    # Cung cấp danh sách tài khoản cho template HTML
     global_accounts_json = json.dumps([{"name": acc["name"], "token": acc["token"]} for acc in GLOBAL_ACCOUNTS])
     return render_template_string(HTML_TEMPLATE, GLOBAL_ACCOUNTS_JSON=global_accounts_json)
 
@@ -545,7 +553,7 @@ def handle_panels():
             "name": name,
             "channel_id": "",
             "server_name": "",
-            "accounts": {f"slot_{i}": "" for i in range(1, 4)}
+            "accounts": {f"slot_{i}": "" for i in range(1, 4)} # 3 slots
         }
         panels.append(new_panel)
         save_panels()
@@ -563,6 +571,7 @@ def handle_panels():
         if 'channel_id' in update_data:
             new_channel_id = update_data['channel_id'].strip()
             panel_to_update['channel_id'] = new_channel_id
+            # Lấy tên server ngay khi cập nhật channel ID
             server_name = get_server_name_from_channel(new_channel_id)
             panel_to_update['server_name'] = server_name
 
@@ -571,7 +580,7 @@ def handle_panels():
                 panel_to_update['accounts'][slot] = token
 
         save_panels()
-        return jsonify(panel_to_update)
+        return jsonify(panel_to_update) # Trả về panel đã cập nhật (với server_name)
 
     elif request.method == 'DELETE':
         data = request.get_json()
@@ -582,13 +591,13 @@ def handle_panels():
         
 @app.route("/status")
 def status():
-    # This part is tricky because the loop is in another thread.
-    # We can add a global variable to track the last send time.
+    # Hàm này sẽ bị ghi đè bởi updated_status trong main()
+    # Nhưng chúng ta giữ nó ở đây để tránh lỗi nếu main() chưa chạy tới
     return jsonify({
         "bot_ready": bot_ready,
         "panels": panels,
         "current_drop_slot": current_drop_slot,
-        "countdown": 605, # This is a placeholder
+        "countdown": 605,
         "is_kd_loop_enabled": is_kd_loop_enabled
     })
     
@@ -597,11 +606,10 @@ def toggle_kd():
     global is_kd_loop_enabled
     is_kd_loop_enabled = not is_kd_loop_enabled
     state = "BẬT" if is_kd_loop_enabled else "TẮT"
+    print(f"[CONTROL] Vòng lặp gửi 'kd' đã được {state}.")
     return jsonify({"message": f"Vòng lặp gửi 'kd' đã được {state}.", "is_enabled": is_kd_loop_enabled})
 
 # --- HÀM KHỞI CHẠY CHÍNH ---
-# Add a global variable for the last cycle time
-last_kd_cycle_time = 0
 
 async def main():
     global last_kd_cycle_time
@@ -611,29 +619,32 @@ async def main():
 
     load_panels()
     
-    last_kd_cycle_time = time.time() # Initialize timer on start
+    last_kd_cycle_time = time.time() # Khởi tạo đồng hồ bấm giờ
 
     def run_flask():
-        from waitress import serve
-        port = int(os.environ.get("PORT", 10000))
-        print(f"Khởi động Web Server tại http://0.0.0.0:{port}")
-        serve(app, host="0.0.0.0", port=port)
+        try:
+            from waitress import serve
+            port = int(os.environ.get("PORT", 10000))
+            print(f"Khởi động Web Server tại http://0.0.0.0:{port}")
+            serve(app, host="0.0.0.0", port=port)
+        except Exception as e:
+            print(f"[FLASK ERROR] Không thể khởi động server: {e}")
     
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    # We need to modify the drop_sender_loop to update the global time
+    # Vòng lặp gửi 'kd' được cập nhật để dùng bot instance
     async def updated_drop_sender_loop():
         global current_drop_slot, last_kd_cycle_time
-        print("Vòng lặp gửi 'kd' đang chờ bot sẵn sàng...")
+        print("Vòng lặp gửi 'kd' đang chờ TẤT CẢ các bot sẵn sàng...")
         while not bot_ready:
             await asyncio.sleep(1)
-        print("Bot đã sẵn sàng. Bắt đầu vòng lặp gửi 'kd'.")
+        print("Tất cả bot đã sẵn sàng. Bắt đầu vòng lặp gửi 'kd'.")
     
         while True:
             if not is_kd_loop_enabled:
                 await asyncio.sleep(5)
-                # When paused, we should also pause the countdown timer
+                # Khi tạm dừng, reset đồng hồ
                 last_kd_cycle_time = time.time()
                 continue
             
@@ -646,9 +657,13 @@ async def main():
                 for panel in panels:
                     channel_id = panel.get("channel_id")
                     token_to_use = panel.get("accounts", {}).get(slot_key)
+                    
+                    # Thay thế logic HTTP bằng logic bot instance
+                    bot_to_use = GLOBAL_BOTS.get(token_to_use)
     
-                    if token_to_use and channel_id:
-                        task = asyncio.to_thread(send_message_http, token_to_use, channel_id, "kd")
+                    if bot_to_use and channel_id:
+                        # task = asyncio.to_thread(send_message_http, token_to_use, channel_id, "kd")
+                        task = send_message_bot(bot_to_use, channel_id, "kd") # Dùng hàm mới
                         tasks.append(task)
                         active_sends +=1
                     
@@ -661,36 +676,42 @@ async def main():
                 current_drop_slot = (current_drop_slot + 1) % 3
     
                 print(f"Đã xong lượt. Chờ 605 giây cho lượt kế tiếp (Slot {current_drop_slot + 1})...")
-                last_kd_cycle_time = time.time() # Reset timer after sending
+                last_kd_cycle_time = time.time() # Reset đồng hồ sau khi gửi
                 await asyncio.sleep(605)
     
             except Exception as e:
                 print(f"[DROP SENDER ERROR] Lỗi nghiêm trọng trong vòng lặp gửi 'kd': {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(60) # Chờ 1 phút nếu có lỗi
 
-    # And the status endpoint needs to calculate the remaining time
+    # Endpoint status được cập nhật để tính toán thời gian countdown
     @app.route("/status")
     def updated_status():
         remaining_time = 0
         if is_kd_loop_enabled:
             elapsed = time.time() - last_kd_cycle_time
             remaining_time = max(0, 605 - elapsed)
+        else:
+            remaining_time = 605 # Hiển thị thời gian đầy đủ nếu đang tắt
 
         return jsonify({
-            "bot_ready": bot_ready,
+            "bot_ready": bot_ready, # Trạng thái chung của tất cả các bot
             "panels": panels,
             "current_drop_slot": current_drop_slot,
             "countdown": remaining_time,
             "is_kd_loop_enabled": is_kd_loop_enabled
         })
     
-    # We have to replace the old status route
+    # Ghi đè route 'status' cũ bằng route 'updated_status' mới
     app.view_functions['status'] = updated_status
 
+    # Tạo task cho vòng lặp gửi 'kd'
     sender_task = asyncio.create_task(updated_drop_sender_loop(), name='drop_sender_loop')
-    listener_task = asyncio.create_task(run_listener_bot(), name='listener_bot')
+    
+    # Tạo task để chạy TẤT CẢ các bot
+    bots_task = asyncio.create_task(run_all_bots(), name='run_all_bots')
 
-    await asyncio.gather(sender_task, listener_task)
+    # Chạy đồng thời 2 task chính
+    await asyncio.gather(sender_task, bots_task)
 
 
 if __name__ == "__main__":
