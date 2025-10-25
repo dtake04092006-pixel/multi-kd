@@ -668,8 +668,17 @@ async def main():
                         active_sends +=1
                     
                 if tasks:
-                    print(f"Gửi đồng thời {active_sends} lệnh 'kd' cho các tài khoản ở {slot_key}...")
-                    await asyncio.gather(*tasks)
+                    print(f"Bắt đầu gửi {active_sends} lệnh 'kd' cho {slot_key} (có giãn cách)...")
+                    # THAY ĐỔI: Không dùng gather, mà gửi tuần tự với độ trễ
+                    for task in tasks:
+                        try:
+                            await task  # Gửi 1 tin nhắn
+                            # Cho event loop "thở" 0.3 giây để xử lý nhịp tim
+                            await asyncio.sleep(0.3) 
+                        except Exception as e:
+                            print(f"[SEND TASK ERROR] Lỗi khi gửi 1 task 'kd': {e}")
+                            
+                    print(f"Đã gửi xong {active_sends} lệnh cho {slot_key}.")
                 else:
                     print(f"Không có tài khoản nào được cấu hình cho {slot_key} trong bất kỳ panel nào.")
     
