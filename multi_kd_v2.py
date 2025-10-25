@@ -184,10 +184,19 @@ def create_bot_instance(account_info, is_listener=False):
     token = account_info["token"]
     name = account_info["name"]
     
-    # Tạo bot với prefix ngẫu nhiên
+    # Tạo intents tối giản để giảm tải
+    intents = discord.Intents.none()
+    intents.guilds = True
+    intents.guild_messages = True
+    intents.message_content = True
+    
+    # Tạo bot với cấu hình tối ưu
     bot = commands.Bot(
         command_prefix=f"!unused_prefix_{random.randint(10000, 99999)}", 
-        self_bot=True
+        self_bot=True,
+        intents=intents,
+        chunk_guilds_at_startup=False,  # QUAN TRỌNG: Tắt guild chunking
+        guild_subscriptions=False        # Tắt guild subscriptions
     )
     
     # Định nghĩa event on_ready
@@ -227,16 +236,39 @@ def create_bot_instance(account_info, is_listener=False):
     
     return bot
 
-async def run_single_bot(bot, token):
-    """Chạy một bot và xử lý lỗi đăng nhập."""
-    try:
-        await bot.start(token)
-    except discord.errors.LoginFailure:
-        print(f"LỖI ĐĂNG NHẬP với token ...{token[-8:]}. Kiểm tra lại token!")
-        bot_ready_flags[token] = False
-    except Exception as e:
-        print(f"Lỗi với bot (Token: ...{token[-8:]}): {e}")
-        bot_ready_flags[token] = False
+async def run_single_bot(bot, token, account_name):
+    """Chạy một bot và xử lý lỗi đăng nhập + reconnect."""
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            print(f"[{account_name}] Đang kết nối... (Lần thử {retry_count + 1}/{max_retries})")
+            await bot.start(token)
+            # Nếu bot.start() kết thúc, có nghĩa là bot đã disconnect
+            print(f"[{account_name}] Bot đã ngắt kết nối.")
+            break
+            
+        except discord.errors.LoginFailure:
+            print(f"[{account_name}] ❌ LỖI ĐĂNG NHẬP - Token không hợp lệ!")
+            bot_ready_flags[token] = False
+            break
+            
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+            retry_count += 1
+            print(f"[{account_name}] ⚠ Lỗi kết nối: {e}")
+            if retry_count < max_retries:
+                wait_time = retry_count * 5
+                print(f"[{account_name}] Chờ {wait_time}s trước khi thử lại...")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"[{account_name}] ❌ Đã thử {max_retries} lần, bỏ qua bot này.")
+                bot_ready_flags[token] = False
+                
+        except Exception as e:
+            print(f"[{account_name}] ❌ Lỗi không xác định: {e}")
+            bot_ready_flags[token] = False
+            break
 
 async def run_all_bots():
     """Khởi chạy TẤT CẢ các tài khoản dưới dạng bot client."""
