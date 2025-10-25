@@ -1,5 +1,5 @@
 # TÊN FILE: main.py
-# PHIÊN BẢN: Multi-Farm Deep Control v2.3 (Stable)
+# PHIÊN BẢN: Multi-Farm Deep Control v3.1 (AIOHTTP + Spoofing)
 import discord
 from discord.ext import commands
 import asyncio
@@ -9,6 +9,7 @@ import time
 import requests
 import json
 import random
+import aiohttp # Thư viện mới
 from flask import Flask, request, render_template_string, jsonify
 from dotenv import load_dotenv
 
@@ -30,47 +31,55 @@ for i, token in enumerate(tokens_list):
     name = acc_names_list[i] if i < len(acc_names_list) else f"Account {i + 1}"
     GLOBAL_ACCOUNTS.append({"id": f"acc_{i}", "name": name, "token": token})
 
-# Biến trạng thái, sẽ được load từ JSONBin
+# Biến trạng thái
 panels = []
 current_drop_slot = 0 # Slot đang trong lượt drop (0-2)
 is_kd_loop_enabled = True
+bot_ready = False # Chỉ cần 1 bot listener sẵn sàng
+listener_bot = None
+last_kd_cycle_time = 0
 
-# Biến trạng thái bot MỚI
-bot_ready = False # Sẽ là True khi TẤT CẢ các bot đã sẵn sàng
-GLOBAL_BOTS = {} # Map: token -> bot_instance
-bot_ready_flags = {} # Map: token -> bool (để theo dõi từng bot)
-last_kd_cycle_time = 0 # Thời gian của lần gửi 'kd' cuối
+# --- CÁC HÀM TIỆN ÍCH & API DISCORD (AIOHTTP + SPOOFING) ---
 
+# FIX LỖI RESET TOKEN: Giả mạo headers để trông giống trình duyệt
+SPOOFED_HEADERS = {
+    "Origin": "https://discord.com",
+    "Referer": "https://discord.com/channels/@me",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "X-Super-Properties": "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzExOC4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTE4LjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiIiLCJyZWZlcnJpbmdfZG9tYWluIjoiIiwicmVmZXJyZXJfY3VycmVudCI6IiIsInJlZmVycmluZ19kb21haW5fY3VycmVudCI6IiIsInJlbGVhc2VfY2hhbm5lbCI6InN0YWJsZSIsImNsaWVudF9idWlsZF9udW1iZXIiOjk5OTk5LCJjbGllbnRfZXZlbnRfc291cmNlIjpudWxsfQ=="
+}
 
-# --- CÁC HÀM TIỆN ÍCH & API DISCORD (ĐÃ THAY ĐỔI) ---
-
-async def send_message_bot(bot_instance, channel_id, content):
-    """Gửi tin nhắn bằng bot instance (FIXED: Dùng non-blocking)."""
-    if not bot_instance or not channel_id: return
+async def send_message_http_async(session, token, channel_id, content):
+    """Gửi tin nhắn bằng AIOHTTP + Spoofed Headers (non-blocking)."""
+    if not token or not channel_id: return
+    
+    headers = SPOOFED_HEADERS.copy()
+    headers["Authorization"] = token
+    
+    payload = {"content": content}
+    url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
     try:
-        # FIX V3 (Lỗi Can't keep up 55.9s):
-        # KHÔNG DÙNG .get_channel() (vì nó blocking)
-        # Dùng .http.send_message (non-blocking) để gửi trực tiếp.
-        await bot_instance.http.send_message(int(channel_id), content)
-        
-    except discord.errors.Forbidden:
-        print(f"[{bot_instance.user.name}] Lỗi: Không có quyền gửi tin nhắn tới kênh {channel_id}.")
-    except discord.errors.NotFound:
-         print(f"[{bot_instance.user.name}] Lỗi: Không tìm thấy kênh {channel_id} (ID sai?).")
+        async with session.post(url, headers=headers, json=payload, timeout=10) as res:
+            if res.status != 200:
+                print(f"[HTTP SEND ERROR] Lỗi khi gửi tin nhắn tới kênh {channel_id}: {res.status}")
     except Exception as e:
-        print(f"[{bot_instance.user.name}] Lỗi ngoại lệ khi gửi tin nhắn: {e}")
+        print(f"[HTTP SEND EXCEPTION] Lỗi ngoại lệ khi gửi tin nhắn: {e}")
 
-async def add_reaction_bot(bot_instance, channel_id, message_id, emoji):
-    """Thả reaction bằng bot instance (non-blocking)."""
-    if not bot_instance or not channel_id: return
+async def add_reaction_http_async(session, token, channel_id, message_id, emoji):
+    """Thả reaction bằng AIOHTTP + Spoofed Headers (non-blocking)."""
+    if not token or not channel_id: return
+
+    headers = SPOOFED_HEADERS.copy()
+    headers["Authorization"] = token
+
+    encoded_emoji = requests.utils.quote(emoji) # Vẫn dùng requests để encode
+    url = f"https://discord.com/api/v9/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me"
     try:
-        # bot.http.add_reaction là non-blocking, giữ nguyên
-        await bot_instance.http.add_reaction(channel_id, message_id, emoji)
-    except discord.errors.Forbidden:
-        print(f"[{bot_instance.user.name}] Lỗi: Không có quyền thả reaction tại {channel_id}.")
+        async with session.put(url, headers=headers, timeout=10) as res:
+            if res.status != 204:
+                 print(f"[HTTP REACT ERROR] Lỗi khi thả reaction {emoji} tới kênh {channel_id}: {res.status}")
     except Exception as e:
-        print(f"[{bot_instance.user.name}] Lỗi ngoại lệ khi thả reaction: {e}")
-
+        print(f"[HTTP REACT EXCEPTION] Lỗi ngoại lệ khi thả reaction: {e}")
 
 # --- LƯU & TẢI CẤU HÌNH PANEL ---
 # (Không thay đổi - Giữ nguyên các hàm save_panels, load_panels, get_server_name_from_channel)
@@ -114,23 +123,27 @@ def load_panels():
                 panels = data
                 print(f"[Settings] Đã tải {len(panels)} panel từ JSONBin.io.")
             else:
-                save_panels() # Nếu dữ liệu rỗng hoặc sai, tạo mới
+                save_panels()
         else:
             print(f"[Settings] Lỗi khi tải cài đặt: {req.status_code} - {req.text}")
     except Exception as e:
         print(f"[Settings] Exception khi tải cài đặt: {e}")
 
 def get_server_name_from_channel(channel_id):
-    """Lấy tên server từ Channel ID thông qua Discord API. (Vẫn dùng HTTP cho việc này vì nó chạy trong thread Flask)"""
+    """Lấy tên server từ Channel ID thông qua Discord API."""
     if not channel_id or not channel_id.isdigit():
         return "ID kênh không hợp lệ"
     if not GLOBAL_ACCOUNTS:
         return "Không có token để xác thực"
 
-    token = GLOBAL_ACCOUNTS[0]["token"] # Dùng token đầu tiên để check
-    headers = {"Authorization": token}
+    token = GLOBAL_ACCOUNTS[0]["token"]
+    # Dùng headers đã giả mạo để kiểm tra
+    headers = SPOOFED_HEADERS.copy()
+    headers["Authorization"] = token
 
     try:
+        # Dùng requests đồng bộ ở đây VẪN ỔN, vì nó chỉ chạy
+        # trong luồng Flask khi người dùng thay đổi Channel ID (hiếm khi xảy ra)
         channel_res = requests.get(f"https://discord.com/api/v9/channels/{channel_id}", headers=headers, timeout=10)
         if channel_res.status_code != 200:
             return "Không tìm thấy kênh"
@@ -149,133 +162,87 @@ def get_server_name_from_channel(channel_id):
 
     except requests.RequestException:
         return "Lỗi mạng"
+        
+# --- LOGIC BOT CHÍNH (AIOHTTP) ---
 
-# --- LOGIC BOT CHÍNH (ĐÃ THAY ĐỔI) ---
-
-async def handle_reactions(panel, message):
-    """Xử lý việc thả reaction cho 3 tài khoản trong một panel. (Dùng bot instance)"""
+async def handle_reactions(session, panel, message):
+    """Xử lý việc thả reaction (dùng AIOHTTP)."""
     accounts_in_panel = panel.get("accounts", {})
     if not accounts_in_panel: return
 
     emojis = ["1️⃣", "2️⃣", "3️⃣"]
-    grab_times = [1.3, 2.3, 3.2] # Giữ nguyên thời gian delay
+    grab_times = [1.3, 2.3, 3.2]
     
     tasks = []
     for i in range(3):
         slot_key = f"slot_{i + 1}"
         token = accounts_in_panel.get(slot_key)
-        
-        # Lấy bot instance từ token
-        bot_to_react = GLOBAL_BOTS.get(token) 
-        
-        if bot_to_react: # Chỉ thực hiện nếu bot tồn tại và đang chạy
+        if token:
             delay = grab_times[i]
             emoji = emojis[i]
-            
-            async def react_task(bot, ch_id, msg_id, em, d):
+            async def react_task(s, t, ch_id, msg_id, em, d):
                 await asyncio.sleep(d)
-                await add_reaction_bot(bot, ch_id, msg_id, em)
+                # Dùng hàm aiohttp mới
+                await add_reaction_http_async(s, t, ch_id, msg_id, em)
             
-            tasks.append(react_task(bot_to_react, message.channel.id, message.id, emoji, delay))
+            tasks.append(react_task(session, token, message.channel.id, message.id, emoji, delay))
 
     if tasks:
         await asyncio.gather(*tasks)
         print(f"Đã hoàn thành các tác vụ reaction cho drop trong kênh {message.channel.id}")
 
-async def run_single_bot(bot, token):
-    """Hàm trợ giúp để chạy một bot và xử lý lỗi đăng nhập."""
-    try:
-        await bot.start(token)
-    except discord.errors.LoginFailure:
-        print(f"LỖI ĐĂNG NHẬP NGHIÊM TRỌNG với token ...{token[-5:]}. Vui lòng kiểm tra lại token!")
-        bot_ready_flags[token] = False # Đánh dấu là lỗi
-    except Exception as e:
-        print(f"Lỗi không xác định với bot (Token: ...{token[-5:]}): {e}")
-        bot_ready_flags[token] = False
-
-async def run_all_bots():
-    """Khởi chạy TẤT CẢ các tài khoản dưới dạng bot client."""
-    global bot_ready, GLOBAL_BOTS, bot_ready_flags
-    
+async def run_listener_bot(session):
+    """Chạy một bot duy nhất để lắng nghe sự kiện drop (Siêu nhẹ)."""
+    global bot_ready, listener_bot
     if not GLOBAL_ACCOUNTS:
         print("Không có token nào trong biến môi trường. Bot không thể khởi động.")
         bot_ready = True
         return
-
-    print(f"Chuẩn bị khởi chạy {len(GLOBAL_ACCOUNTS)} tài khoản (giãn cách 5 giây)...")
     
-    tasks = []
-    for i, acc in enumerate(GLOBAL_ACCOUNTS):
-        token = acc["token"]
-        bot_ready_flags[token] = False
-        
-        # FIX V4 (Lỗi Can't keep up 71.0s):
-        # Tắt các tính năng nặng nề không cần thiết (member scraping)
-        bot = commands.Bot(
-            command_prefix=f"!prefix_ko_dung_{random.randint(1000, 9999)}", 
-            self_bot=True,
-            chunk_guilds_at_startup=False,  # CỰC KỲ QUAN TRỌNG: Tắt member list scraping
-            member_cache_flags=discord.MemberCacheFlags.none() # Tắt cache member
-        )
-        GLOBAL_BOTS[token] = bot # Lưu bot instance
-        
-        # Gắn sự kiện on_ready cho TẤT CẢ các bot
-        @bot.event
-        async def on_ready(token=token): # Dùng closure để bắt giá trị token
-            global bot_ready
-            current_bot = GLOBAL_BOTS[token]
-            print(f"[BOT READY] Tài khoản '{current_bot.user.name}' (ID: {current_bot.user.id}) đã kết nối.")
-            bot_ready_flags[token] = True
-            
-            # Kiểm tra xem tất cả bot đã sẵn sàng chưa
-            if all(bot_ready_flags.values()) and not bot_ready:
-                print("-" * 30)
-                print(f"TẤT CẢ ({len(GLOBAL_BOTS)}) CÁC BOT ĐÃ SẴN SÀNG!")
-                print("-" * 30)
-                bot_ready = True # Chỉ set True khi tất cả cùng online
+    listener_token = GLOBAL_ACCOUNTS[0]["token"]
+    
+    # Tắt các tính năng nặng nề không cần thiết
+    listener_bot = commands.Bot(
+        command_prefix="!слушать", 
+        self_bot=True,
+        chunk_guilds_at_startup=False, # Tắt scrape member
+        member_cache_flags=discord.MemberCacheFlags.none() # Tắt cache member
+    )
 
-        # CHỈ gắn sự kiện on_message cho bot ĐẦU TIÊN (bot lắng nghe)
-        if i == 0:
-            listener_name = acc["name"]
-            print(f"-> Gắn '{listener_name}' làm BOT LẮNG NGHE CHÍNH.")
-            
-            @bot.event
-            async def on_message(message):
-                # Chỉ xử lý nếu là drop của Karuta
-                if message.author.id != KARUTA_ID or "is dropping 3 cards!" not in message.content:
-                    return
+    @listener_bot.event
+    async def on_ready():
+        global bot_ready
+        print("-" * 30)
+        print(f"BOT LẮNG NGHE ĐÃ SẴN SÀNG!")
+        print(f"Đăng nhập với tài khoản: {listener_bot.user} (ID: {listener_bot.user.id})")
+        print("Kiến trúc: 1 Bot Online + AIOHTTP (Spoofed) Requests.")
+        print("-" * 30)
+        bot_ready = True
 
-                # Tìm panel tương ứng với kênh này
-                found_panel = None
-                for p in panels:
-                    if p.get("channel_id") == str(message.channel.id):
-                        found_panel = p
-                        break
-                
-                if found_panel:
-                    print(f"[LISTENER] Phát hiện drop trong kênh {message.channel.id} (Panel: '{found_panel.get('name')}')")
-                    # Tạo task để xử lý reaction, không làm nghẽn bot
-                    asyncio.create_task(handle_reactions(found_panel, message))
+    @listener_bot.event
+    async def on_message(message):
+        if message.author.id != KARUTA_ID or "is dropping 3 cards!" not in message.content:
+            return
 
-        # FIX V4 (Lỗi Bão khởi động):
-        # "Rải" các lượt đăng nhập ra, mỗi bot cách nhau 5 giây
+        found_panel = None
+        for p in panels:
+            if p.get("channel_id") == str(message.channel.id):
+                found_panel = p
+                break
         
-        print(f"[STARTUP] Chuẩn bị khởi động bot {i + 1}/{len(GLOBAL_ACCOUNTS)}: {acc['name']}")
-        
-        # 1. Tạo task và ném vào event loop ngay lập tức
-        task = asyncio.create_task(run_single_bot(bot, token))
-        
-        # 2. Lưu lại task để gather sau
-        tasks.append(task) 
-        
-        # 3. Chờ 5 giây trước khi khởi động bot tiếp theo
-        await asyncio.sleep(5) 
+        if found_panel:
+            print(f"Phát hiện drop trong kênh {message.channel.id} (Panel: '{found_panel.get('name')}')")
+            # Truyền session (AIOHTTP) vào
+            asyncio.create_task(handle_reactions(session, found_panel, message))
 
-    print("[STARTUP] Tất cả các bot đã được lệnh khởi động. Đang chờ chúng chạy...")
-
-    # Chạy tất cả các bot song song (gather để giữ hàm này "sống")
-    await asyncio.gather(*tasks)
-
+    try:
+        await listener_bot.start(listener_token)
+    except discord.errors.LoginFailure:
+        print(f"LỖI ĐĂNG NHẬP NGHIÊM TRỌNG với token của bot lắng nghe. Vui lòng kiểm tra TOKEN đầu tiên trong file .env.")
+        bot_ready = True
+    except Exception as e:
+        print(f"Lỗi không xác định với bot lắng nghe: {e}")
+        bot_ready = True
 
 # --- GIAO DIỆN WEB & API FLASK ---
 # (Không thay đổi - Giữ nguyên toàn bộ phần Flask)
@@ -605,7 +572,6 @@ def handle_panels():
 @app.route("/status")
 def status():
     # Hàm này sẽ bị ghi đè bởi updated_status trong main()
-    # Nhưng chúng ta giữ nó ở đây để tránh lỗi nếu main() chưa chạy tới
     return jsonify({
         "bot_ready": bot_ready,
         "panels": panels,
@@ -646,13 +612,13 @@ async def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    # Vòng lặp gửi 'kd' được cập nhật để dùng bot instance
-    async def updated_drop_sender_loop():
+    # Vòng lặp gửi 'kd' được cập nhật để dùng AIOHTTP
+    async def updated_drop_sender_loop(session):
         global current_drop_slot, last_kd_cycle_time
-        print("Vòng lặp gửi 'kd' đang chờ TẤT CẢ các bot sẵn sàng...")
+        print("Vòng lặp gửi 'kd' đang chờ BOT LẮNG NGHE sẵn sàng...")
         while not bot_ready:
             await asyncio.sleep(1)
-        print("Tất cả bot đã sẵn sàng. Bắt đầu vòng lặp gửi 'kd'.")
+        print("Bot lắng nghe đã sẵn sàng. Bắt đầu vòng lặp gửi 'kd'.")
     
         while True:
             if not is_kd_loop_enabled:
@@ -670,23 +636,21 @@ async def main():
                 for panel in panels:
                     channel_id = panel.get("channel_id")
                     token_to_use = panel.get("accounts", {}).get(slot_key)
-                    
-                    # Thay thế logic HTTP bằng logic bot instance
-                    bot_to_use = GLOBAL_BOTS.get(token_to_use)
     
-                    if bot_to_use and channel_id:
-                        task = send_message_bot(bot_to_use, channel_id, "kd") # Dùng hàm mới
+                    if token_to_use and channel_id:
+                        # Dùng hàm aiohttp mới
+                        task = send_message_http_async(session, token_to_use, channel_id, "kd")
                         tasks.append(task)
                         active_sends +=1
                 
-                # FIX V2 (Lỗi Can't keep up):
-                # Không dùng gather, mà gửi tuần tự với độ trễ (rải)
+                # FIX LỖI `Can't keep up`: "rải" các request ra
+                # (Ngay cả với aiohttp, 50 request cùng lúc có thể làm nghẽn CPU yếu)
                 if tasks:
                     print(f"Bắt đầu gửi {active_sends} lệnh 'kd' cho {slot_key} (có giãn cách)...")
                     for task in tasks:
                         try:
                             await task  # Gửi 1 tin nhắn
-                            # Cho event loop "thở" 0.3 giây để xử lý nhịp tim
+                            # Cho event loop "thở" một chút
                             await asyncio.sleep(0.3) 
                         except Exception as e:
                             print(f"[SEND TASK ERROR] Lỗi khi gửi 1 task 'kd': {e}")
@@ -716,7 +680,7 @@ async def main():
             remaining_time = 605 # Hiển thị thời gian đầy đủ nếu đang tắt
 
         return jsonify({
-            "bot_ready": bot_ready, # Trạng thái chung của tất cả các bot
+            "bot_ready": bot_ready, # Chỉ cần 1 bot
             "panels": panels,
             "current_drop_slot": current_drop_slot,
             "countdown": remaining_time,
@@ -726,14 +690,16 @@ async def main():
     # Ghi đè route 'status' cũ bằng route 'updated_status' mới
     app.view_functions['status'] = updated_status
 
-    # Tạo task cho vòng lặp gửi 'kd'
-    sender_task = asyncio.create_task(updated_drop_sender_loop(), name='drop_sender_loop')
-    
-    # Tạo task để chạy TẤT CẢ các bot
-    bots_task = asyncio.create_task(run_all_bots(), name='run_all_bots')
+    # Khởi tạo AIOHTTP ClientSession DUY NHẤT
+    async with aiohttp.ClientSession() as session:
+        # Tạo task cho vòng lặp gửi 'kd'
+        sender_task = asyncio.create_task(updated_drop_sender_loop(session), name='drop_sender_loop')
+        
+        # Tạo task để chạy 1 bot lắng nghe
+        listener_task = asyncio.create_task(run_listener_bot(session), name='listener_bot')
 
-    # Chạy đồng thời 2 task chính
-    await asyncio.gather(sender_task, bots_task)
+        # Chạy đồng thời 2 task chính
+        await asyncio.gather(sender_task, listener_task)
 
 
 if __name__ == "__main__":
@@ -742,5 +708,10 @@ if __name__ == "__main__":
     except ImportError:
         print("Đang cài đặt waitress...")
         os.system('pip install waitress')
+    try:
+        import aiohttp
+    except ImportError:
+        print("Đang cài đặt aiohttp...")
+        os.system('pip install aiohttp')
         
     asyncio.run(main())
