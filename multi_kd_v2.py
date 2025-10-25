@@ -1,5 +1,5 @@
 # TÊN FILE: main.py
-# PHIÊN BẢN: Multi-Farm Deep Control v2.2 (All-Online)
+# PHIÊN BẢN: Multi-Farm Deep Control v2.3 (Stable)
 import discord
 from discord.ext import commands
 import asyncio
@@ -45,17 +45,14 @@ last_kd_cycle_time = 0 # Thời gian của lần gửi 'kd' cuối
 # --- CÁC HÀM TIỆN ÍCH & API DISCORD (ĐÃ THAY ĐỔI) ---
 
 async def send_message_bot(bot_instance, channel_id, content):
-    """Gửi tin nhắn bằng bot instance (đã sửa lỗi blocking)."""
+    """Gửi tin nhắn bằng bot instance (FIXED: Dùng non-blocking)."""
     if not bot_instance or not channel_id: return
     try:
-        # SỬA ĐỔI QUAN TRỌNG:
-        # Không dùng .get_channel() (blocking)
+        # FIX V3 (Lỗi Can't keep up 55.9s):
+        # KHÔNG DÙNG .get_channel() (vì nó blocking)
         # Dùng .http.send_message (non-blocking) để gửi trực tiếp.
         await bot_instance.http.send_message(int(channel_id), content)
         
-        # Chúng ta không cần print log ở đây nữa vì nó có thể làm chậm
-        # print(f"[{bot_instance.user.name}] Gửi '{content}' tới kênh {channel_id} thành công.")
-
     except discord.errors.Forbidden:
         print(f"[{bot_instance.user.name}] Lỗi: Không có quyền gửi tin nhắn tới kênh {channel_id}.")
     except discord.errors.NotFound:
@@ -64,12 +61,11 @@ async def send_message_bot(bot_instance, channel_id, content):
         print(f"[{bot_instance.user.name}] Lỗi ngoại lệ khi gửi tin nhắn: {e}")
 
 async def add_reaction_bot(bot_instance, channel_id, message_id, emoji):
-    """Thả reaction bằng bot instance (thay vì HTTP)."""
+    """Thả reaction bằng bot instance (non-blocking)."""
     if not bot_instance or not channel_id: return
     try:
-        # Sử dụng bot.http.add_reaction đáng tin cậy hơn
+        # bot.http.add_reaction là non-blocking, giữ nguyên
         await bot_instance.http.add_reaction(channel_id, message_id, emoji)
-        # print(f"[{bot_instance.user.name}] Thả reaction {emoji} thành công.")
     except discord.errors.Forbidden:
         print(f"[{bot_instance.user.name}] Lỗi: Không có quyền thả reaction tại {channel_id}.")
     except Exception as e:
@@ -156,8 +152,6 @@ def get_server_name_from_channel(channel_id):
 
 # --- LOGIC BOT CHÍNH (ĐÃ THAY ĐỔI) ---
 
-# (Hàm drop_sender_loop sẽ được định nghĩa lại bên trong main())
-
 async def handle_reactions(panel, message):
     """Xử lý việc thả reaction cho 3 tài khoản trong một panel. (Dùng bot instance)"""
     accounts_in_panel = panel.get("accounts", {})
@@ -180,7 +174,6 @@ async def handle_reactions(panel, message):
             
             async def react_task(bot, ch_id, msg_id, em, d):
                 await asyncio.sleep(d)
-                # Gọi hàm add_reaction_bot mới
                 await add_reaction_bot(bot, ch_id, msg_id, em)
             
             tasks.append(react_task(bot_to_react, message.channel.id, message.id, emoji, delay))
@@ -194,7 +187,7 @@ async def run_single_bot(bot, token):
     try:
         await bot.start(token)
     except discord.errors.LoginFailure:
-        print(f"LỖI ĐĂNG NHẬP NGHIÊM TRỌNG với token của tài khoản. Vui lòng kiểm tra lại token!")
+        print(f"LỖI ĐĂNG NHẬP NGHIÊM TRỌNG với token ...{token[-5:]}. Vui lòng kiểm tra lại token!")
         bot_ready_flags[token] = False # Đánh dấu là lỗi
     except Exception as e:
         print(f"Lỗi không xác định với bot (Token: ...{token[-5:]}): {e}")
@@ -209,17 +202,21 @@ async def run_all_bots():
         bot_ready = True
         return
 
-    print(f"Chuẩn bị khởi chạy {len(GLOBAL_ACCOUNTS)} tài khoản...")
+    print(f"Chuẩn bị khởi chạy {len(GLOBAL_ACCOUNTS)} tài khoản (giãn cách 5 giây)...")
     
     tasks = []
     for i, acc in enumerate(GLOBAL_ACCOUNTS):
         token = acc["token"]
         bot_ready_flags[token] = False
         
-        # Tạo bot instance
-        # self_bot=True là cần thiết cho user token
-        # prefix ngẫu nhiên để tránh xung đột
-        bot = commands.Bot(command_prefix=f"!prefix_ko_dung_{random.randint(1000, 9999)}", self_bot=True)
+        # FIX V4 (Lỗi Can't keep up 71.0s):
+        # Tắt các tính năng nặng nề không cần thiết (member scraping)
+        bot = commands.Bot(
+            command_prefix=f"!prefix_ko_dung_{random.randint(1000, 9999)}", 
+            self_bot=True,
+            chunk_guilds_at_startup=False,  # CỰC KỲ QUAN TRỌNG: Tắt member list scraping
+            member_cache_flags=discord.MemberCacheFlags.none() # Tắt cache member
+        )
         GLOBAL_BOTS[token] = bot # Lưu bot instance
         
         # Gắn sự kiện on_ready cho TẤT CẢ các bot
@@ -231,7 +228,7 @@ async def run_all_bots():
             bot_ready_flags[token] = True
             
             # Kiểm tra xem tất cả bot đã sẵn sàng chưa
-            if all(bot_ready_flags.values()):
+            if all(bot_ready_flags.values()) and not bot_ready:
                 print("-" * 30)
                 print(f"TẤT CẢ ({len(GLOBAL_BOTS)}) CÁC BOT ĐÃ SẴN SÀNG!")
                 print("-" * 30)
@@ -260,10 +257,23 @@ async def run_all_bots():
                     # Tạo task để xử lý reaction, không làm nghẽn bot
                     asyncio.create_task(handle_reactions(found_panel, message))
 
-        # Tạo task để chạy bot này
-        tasks.append(run_single_bot(bot, token))
+        # FIX V4 (Lỗi Bão khởi động):
+        # "Rải" các lượt đăng nhập ra, mỗi bot cách nhau 5 giây
+        
+        print(f"[STARTUP] Chuẩn bị khởi động bot {i + 1}/{len(GLOBAL_ACCOUNTS)}: {acc['name']}")
+        
+        # 1. Tạo task và ném vào event loop ngay lập tức
+        task = asyncio.create_task(run_single_bot(bot, token))
+        
+        # 2. Lưu lại task để gather sau
+        tasks.append(task) 
+        
+        # 3. Chờ 5 giây trước khi khởi động bot tiếp theo
+        await asyncio.sleep(5) 
 
-    # Chạy tất cả các bot song song
+    print("[STARTUP] Tất cả các bot đã được lệnh khởi động. Đang chờ chúng chạy...")
+
+    # Chạy tất cả các bot song song (gather để giữ hàm này "sống")
     await asyncio.gather(*tasks)
 
 
@@ -665,14 +675,14 @@ async def main():
                     bot_to_use = GLOBAL_BOTS.get(token_to_use)
     
                     if bot_to_use and channel_id:
-                        # task = asyncio.to_thread(send_message_http, token_to_use, channel_id, "kd")
                         task = send_message_bot(bot_to_use, channel_id, "kd") # Dùng hàm mới
                         tasks.append(task)
                         active_sends +=1
-                    
+                
+                # FIX V2 (Lỗi Can't keep up):
+                # Không dùng gather, mà gửi tuần tự với độ trễ (rải)
                 if tasks:
                     print(f"Bắt đầu gửi {active_sends} lệnh 'kd' cho {slot_key} (có giãn cách)...")
-                    # THAY ĐỔI: Không dùng gather, mà gửi tuần tự với độ trễ
                     for task in tasks:
                         try:
                             await task  # Gửi 1 tin nhắn
